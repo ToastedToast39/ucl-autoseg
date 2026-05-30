@@ -1,17 +1,17 @@
 """
 Data loading for the UCL pipeline.
 
-UCLSegDataset      mirrors TendonSegDataset from tendon/data.py exactly
-                   (same augmentation: hflip, gain/bias, speckle noise)
+Supports two mask formats — the pipeline accepts whichever is present:
 
-UCLLandmarkDataset new — reads companion point JSON files from points/
-                   and builds (N,H,W) Gaussian heatmap tensors as targets
+  NIfTI masks (.nii.gz)  — saved directly from 3D Slicer Segment Editor
+                           This is now the PRIMARY format. Label in Slicer,
+                           save with the module, train directly. No conversion.
 
-labelme_to_masks_and_points
-                   extends labelme_to_masks from tendon/data.py to also
-                   extract point annotations into a separate JSON per image
+  PNG masks (.png)       — legacy indexed PNGs from Labelme workflow.
+                           Still supported so old labels aren't lost.
 
-pad_to_multiple / unpad  — identical to tendon/data.py
+UCLSegDataset checks for .nii.gz first, falls back to .png.
+Everything else (augmentation, padding, U-Net input format) is unchanged.
 """
 from __future__ import annotations
 import json, os
@@ -29,30 +29,32 @@ except Exception:
     _HAS_TORCH = False
     Dataset = object
 
+try:
+    import nibabel as nib
+    _HAS_NIBABEL = True
+except Exception:
+    _HAS_NIBABEL = False
+
 
 # ---------------------------------------------------------------------------
-# Landmark and class definitions  (change here if clinical spec changes)
+# Class definitions
 # ---------------------------------------------------------------------------
 
 LANDMARK_NAMES: list[str] = [
-    # Kept minimal for Phase 1 — segmentation context model comes first.
-    # Landmarks for gap distance, trochlea length etc. added in Phase 2
-    # once segmentation is reliable.
-    "ucl_humeral",   # proximal UCL attachment on medial epicondyle
-    "ucl_ulnar",     # distal UCL attachment on sublime tubercle
+    "ucl_humeral",
+    "ucl_ulnar",
 ]
 
 SEG_CLASS_MAP: dict[str, int] = {
-    # Phase 1: start with the two most visible structures — the bone surfaces.
-    # Once humerus and ulna segment reliably, add ucl and flexor_pronator.
-    "humerus": 1,   # humeral bone surface / trochlea
-    "ulna":    2,   # ulnar bone surface / sublime tubercle
+    # Phase 1: bone surfaces first
+    "humerus": 1,
+    "ulna":    2,
 }
 NUM_SEG_CLASSES = 3   # 0=bg, 1=humerus, 2=ulna
 
 
 # ---------------------------------------------------------------------------
-# Padding utilities — verbatim from tendon/data.py
+# Padding utilities
 # ---------------------------------------------------------------------------
 
 def pad_to_multiple(arr: np.ndarray, mult: int = 16):
@@ -72,63 +74,125 @@ def unpad(arr: np.ndarray, pad: tuple[int, int]):
 
 
 # ---------------------------------------------------------------------------
-# Dataset A: Segmentation  (mirrors TendonSegDataset)
+# Mask loading — NIfTI (Slicer) or PNG (Labelme)
+# ---------------------------------------------------------------------------
+
+def load_mask(stem: str, mask_dir: Path, num_classes: int) -> Optional[np.ndarray]:
+    """Load a segmentation mask for a given image stem.
+
+    Checks for NIfTI first (from Slicer), then PNG (from Labelme).
+    Returns (H, W) int64 array with class IDs, or None if not found.
+    """
+    # NIfTI from Slicer Segment Editor
+    nii_path = mask_dir / (stem + ".nii.gz")
+    if nii_path.exists() and _HAS_NIBABEL:
+        data = nib.load(str(nii_path)).get_fdata()
+        # Slicer saves (X, Y, Z) — squeeze Z and transpose to (H, W)
+        if data.ndim == 3:
+            data = data[:, :, 0]
+        m = np.array(data, dtype=np.int64).T   # transpose X,Y → row,col
+        if m.max() > num_classes - 1:
+            m = np.clip(m, 0, num_classes - 1)
+        return m
+
+    # PNG from Labelme (legacy)
+    png_path = mask_dir / (stem + ".png")
+    if png_path.exists():
+        m = np.asarray(Image.open(png_path).convert("L"))
+        if m.max() > num_classes - 1:
+            m = (m > 127).astype(np.int64)
+        else:
+            m = m.astype(np.int64)
+        return m
+
+    return None
+
+
+def mask_exists(stem: str, mask_dir: Path) -> bool:
+    """Check if any mask format exists for this image stem."""
+    return (mask_dir / (stem + ".nii.gz")).exists() or \
+           (mask_dir / (stem + ".png")).exists()
+
+
+# ---------------------------------------------------------------------------
+# Dataset A: Segmentation
 # ---------------------------------------------------------------------------
 
 class UCLSegDataset(Dataset):
-    """Image/mask pairs for multi-class UCL segmentation.
+    """Image + mask pairs for UCL segmentation training.
+
+    Accepts NIfTI masks (from Slicer) and PNG masks (from Labelme).
+    NIfTI takes priority when both exist.
 
     Layout:
-        root/images/   *.png or *.jpg
-        root/masks/    *.png  (indexed: 0=bg, 1=ucl, 2=bone_humerus, 3=bone_ulna)
-
-    Augmentation mirrors TendonSegDataset: hflip, gain/bias jitter, speckle.
+        root/images/   *.dcm  OR  *.png  OR  *.jpg
+        root/masks/    *.nii.gz  (from Slicer)  OR  *.png  (from Labelme)
     """
     def __init__(self, root: str, augment: bool = False,
                  resize: Optional[tuple] = None,
                  num_classes: int = NUM_SEG_CLASSES):
         if not _HAS_TORCH: raise RuntimeError("PyTorch required")
-        self.img_dir = Path(root) / "images"
-        self.msk_dir = Path(root) / "masks"
-        all_imgs = sorted(self.img_dir.glob("*.png")) + sorted(self.img_dir.glob("*.jpg"))
+        self.img_dir     = Path(root) / "images"
+        self.msk_dir     = Path(root) / "masks"
+        self.augment     = augment
+        self.resize      = resize
+        self.num_classes = num_classes
+
+        # accept DICOMs, PNGs, or JPGs as source images
+        all_imgs = (sorted(self.img_dir.glob("*.dcm")) +
+                    sorted(self.img_dir.glob("*.png")) +
+                    sorted(self.img_dir.glob("*.jpg")))
         self.files = sorted(
             p.name for p in all_imgs
-            if (self.msk_dir / (p.stem + ".png")).exists()
+            if mask_exists(p.stem, self.msk_dir)
         )
-        self.augment = augment
-        self.resize  = resize
-        self.num_classes = num_classes
 
     def __len__(self): return len(self.files)
 
-    def _load(self, name):
-        img = Image.open(self.img_dir / name).convert("L")
-        msk = Image.open(self.msk_dir / (Path(name).stem + ".png")).convert("L")
+    def _load_image(self, name: str) -> np.ndarray:
+        """Load image as grayscale float32 [0,1]."""
+        p = self.img_dir / name
+        if p.suffix.lower() == ".dcm":
+            import pydicom
+            ds  = pydicom.dcmread(str(p), force=True)
+            arr = ds.pixel_array
+            while arr.ndim > 3:
+                arr = arr[0] if arr.shape[0] == 1 else arr.reshape(arr.shape[-3], arr.shape[-2], arr.shape[-1])
+            if arr.ndim == 3 and arr.shape[2] == 3:
+                arr = (0.299*arr[:,:,0]+0.587*arr[:,:,1]+0.114*arr[:,:,2]).astype(np.uint8)
+            elif arr.ndim == 3:
+                arr = arr[:,:,0]
+            img = arr.astype(np.float32) / 255.0
+        else:
+            img_pil = Image.open(p).convert("L")
+            img = np.asarray(img_pil, np.float32) / 255.0
         if self.resize:
             H, W = self.resize
-            img = img.resize((W, H), Image.BILINEAR)
-            msk = msk.resize((W, H), Image.NEAREST)
-        img = np.asarray(img, np.float32) / 255.0
-        m   = np.asarray(msk)
-        # accept both 0/255 binary masks and indexed label maps
-        m = (m > 127).astype(np.int64) if m.max() > self.num_classes-1 else m.astype(np.int64)
-        return img, m
+            img_pil = Image.fromarray((img*255).astype(np.uint8)).resize((W,H), Image.BILINEAR)
+            img = np.asarray(img_pil, np.float32) / 255.0
+        return img
 
     def _augment(self, img, msk):
-        # horizontal flip — matches TendonSegDataset
         if np.random.rand() < 0.5:
             img = img[:, ::-1].copy(); msk = msk[:, ::-1].copy()
-        # gain/bias jitter (ultrasound gain varies — same as reference)
         if np.random.rand() < 0.5:
-            img = np.clip(img * np.random.uniform(0.8, 1.2)
-                          + np.random.uniform(-0.05, 0.05), 0, 1)
-        # speckle noise — same as reference
+            img = np.clip(img * np.random.uniform(0.8,1.2) + np.random.uniform(-0.05,0.05), 0, 1)
         if np.random.rand() < 0.3:
             img = np.clip(img + np.random.randn(*img.shape) * 0.02, 0, 1)
         return img, msk
 
     def __getitem__(self, idx):
-        img, msk = self._load(self.files[idx])
+        name = self.files[idx]
+        img  = self._load_image(name)
+        msk  = load_mask(Path(name).stem, self.msk_dir, self.num_classes)
+        if msk is None:
+            msk = np.zeros(img.shape[:2], dtype=np.int64)
+        # resize mask if needed
+        if self.resize and msk.shape != tuple(self.resize):
+            H, W = self.resize
+            msk = np.asarray(
+                Image.fromarray(msk.astype(np.uint8)).resize((W,H), Image.NEAREST),
+                np.int64)
         if self.augment: img, msk = self._augment(img, msk)
         img, _ = pad_to_multiple(img.astype(np.float32), 16)
         msk, _ = pad_to_multiple(msk.astype(np.int64),   16)
@@ -136,56 +200,39 @@ class UCLSegDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Dataset B: Landmark heatmap regression  (new — no patellar equivalent)
+# Dataset B: Landmark heatmap regression (unchanged)
 # ---------------------------------------------------------------------------
 
 class UCLLandmarkDataset(Dataset):
-    """Image + Gaussian heatmap targets for landmark localization.
-
-    Layout:
-        root/images/   *.png or *.jpg
-        root/points/   *.json  {landmark_name: [x,y] or null}
-
-    Produces:
-        img_tensor  (1, H, W) float32
-        heatmaps    (N, H, W) float32 in [0,1]
-        visible     (N,) bool — True where landmark IS labeled
-    """
     def __init__(self, root: str, augment: bool = False,
                  resize: Optional[tuple] = None,
                  landmark_names: list[str] = LANDMARK_NAMES,
                  sigma: float = 8.0):
         if not _HAS_TORCH: raise RuntimeError("PyTorch required")
-        self.img_dir   = Path(root) / "images"
-        self.pts_dir   = Path(root) / "points"
+        self.img_dir        = Path(root) / "images"
+        self.pts_dir        = Path(root) / "points"
         all_imgs = sorted(self.img_dir.glob("*.png")) + sorted(self.img_dir.glob("*.jpg"))
-        self.files = sorted(
-            p.name for p in all_imgs
-            if (self.pts_dir / (p.stem + ".json")).exists()
-        )
-        self.augment = augment
-        self.resize  = resize
+        self.files = sorted(p.name for p in all_imgs if (self.pts_dir/(p.stem+".json")).exists())
+        self.augment        = augment
+        self.resize         = resize
         self.landmark_names = landmark_names
-        self.sigma   = sigma
+        self.sigma          = sigma
 
     def __len__(self): return len(self.files)
 
     def _load(self, name):
-        img = Image.open(self.img_dir / name).convert("L")
+        img = Image.open(self.img_dir/name).convert("L")
         W0, H0 = img.size
-        with open(self.pts_dir / (Path(name).stem + ".json")) as f:
+        with open(self.pts_dir/(Path(name).stem+".json")) as f:
             pts = json.load(f)
         if self.resize:
-            H, W = self.resize
-            sx, sy = W/W0, H/H0
-            img = img.resize((W, H), Image.BILINEAR)
+            H, W = self.resize; sx, sy = W/W0, H/H0
+            img = img.resize((W,H), Image.BILINEAR)
         else:
             H, W, sx, sy = H0, W0, 1.0, 1.0
-        img_arr = np.asarray(img, np.float32) / 255.0
-        landmarks = []
-        for nm in self.landmark_names:
-            pt = pts.get(nm)
-            landmarks.append((float(pt[0])*sx, float(pt[1])*sy) if pt else None)
+        img_arr   = np.asarray(img, np.float32) / 255.0
+        landmarks = [(float(pts[nm][0])*sx, float(pts[nm][1])*sy) if pts.get(nm) else None
+                     for nm in self.landmark_names]
         return img_arr, landmarks, H, W
 
     def __getitem__(self, idx):
@@ -193,71 +240,12 @@ class UCLLandmarkDataset(Dataset):
         img_arr, landmarks, H, W = self._load(self.files[idx])
         if self.augment:
             if np.random.rand() < 0.5:
-                img_arr = img_arr[:, ::-1].copy()
-                landmarks = [
-                    (W-1-pt[0], pt[1]) if pt else None for pt in landmarks
-                ]
+                img_arr   = img_arr[:,::-1].copy()
+                landmarks = [(W-1-pt[0],pt[1]) if pt else None for pt in landmarks]
             if np.random.rand() < 0.5:
-                img_arr = np.clip(
-                    img_arr * np.random.uniform(0.8,1.2)
-                    + np.random.uniform(-0.05, 0.05), 0, 1)
+                img_arr = np.clip(img_arr*np.random.uniform(0.8,1.2)+np.random.uniform(-0.05,0.05),0,1)
         img_arr, pad = pad_to_multiple(img_arr.astype(np.float32), 16)
-        pH, pW = img_arr.shape
+        pH, pW   = img_arr.shape
         heatmaps = make_gaussian_heatmaps(landmarks, pH, pW, self.sigma)
         visible  = torch.tensor([pt is not None for pt in landmarks], dtype=torch.bool)
         return torch.from_numpy(img_arr)[None], heatmaps, visible
-
-
-# ---------------------------------------------------------------------------
-# Labelme → masks + points  (extends labelme_to_masks from tendon/data.py)
-# ---------------------------------------------------------------------------
-
-def labelme_to_masks_and_points(
-    json_dir: str,
-    out_mask_dir: str,
-    out_points_dir: str,
-    seg_class_map: dict[str, int] = SEG_CLASS_MAP,
-    landmark_names: list[str] = LANDMARK_NAMES,
-    img_size: Optional[tuple] = None,
-):
-    """Convert Labelme JSON files to indexed masks + landmark coordinate JSON.
-
-    Extends labelme_to_masks (tendon/data.py) to also extract point shapes.
-
-    polygon shapes → indexed PNG masks (0=bg, 1=ucl, 2=bone_humerus, 3=bone_ulna)
-    point shapes   → {landmark_name: [x,y] or null} JSON files
-    """
-    os.makedirs(out_mask_dir,   exist_ok=True)
-    os.makedirs(out_points_dir, exist_ok=True)
-    for jf in sorted(glob(os.path.join(json_dir, "*.json"))):
-        with open(jf) as f:
-            d = json.load(f)
-        if img_size:
-            H, W = img_size
-        else:
-            H, W = d["imageHeight"], d["imageWidth"]
-        stem = Path(d.get("imagePath", jf)).stem
-
-        # --- segmentation mask (polygon shapes) ---
-        mask = Image.new("L", (W, H), 0)
-        draw = ImageDraw.Draw(mask)
-        for label, cid in sorted(seg_class_map.items(), key=lambda kv: kv[1]):
-            for shp in d.get("shapes", []):
-                if shp.get("label") != label or shp.get("shape_type") != "polygon":
-                    continue
-                pts = [tuple(p) for p in shp["points"]]
-                if len(pts) >= 3:
-                    draw.polygon(pts, fill=int(cid))
-        mask.save(os.path.join(out_mask_dir, f"{stem}.png"))
-
-        # --- landmark points (point shapes) ---
-        pts_out = {nm: None for nm in landmark_names}
-        for shp in d.get("shapes", []):
-            if shp.get("shape_type") != "point": continue
-            nm = shp.get("label", "")
-            if nm in pts_out:
-                pts_out[nm] = [float(shp["points"][0][0]), float(shp["points"][0][1])]
-        with open(os.path.join(out_points_dir, f"{stem}.json"), "w") as f:
-            json.dump(pts_out, f, indent=2)
-    print(f"Converted {len(glob(os.path.join(json_dir,'*.json')))} files → "
-          f"{out_mask_dir}  +  {out_points_dir}")
