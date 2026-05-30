@@ -150,20 +150,24 @@ class UCLSegDataset(Dataset):
     def __len__(self): return len(self.files)
 
     def _load_image(self, name: str) -> np.ndarray:
-        """Load image as grayscale float32 [0,1]."""
+        """Load image as grayscale float32 [0,1] for model input.
+        Source can be RGB DICOM or PNG — always converted to grayscale for training.
+        """
         p = self.img_dir / name
         if p.suffix.lower() == ".dcm":
             import pydicom
             ds  = pydicom.dcmread(str(p), force=True)
             arr = ds.pixel_array
             while arr.ndim > 3:
-                arr = arr[0] if arr.shape[0] == 1 else arr.reshape(arr.shape[-3], arr.shape[-2], arr.shape[-1])
+                arr = arr[0] if arr.shape[0]==1 else arr.reshape(arr.shape[-3],arr.shape[-2],arr.shape[-1])
+            # RGB → grayscale
             if arr.ndim == 3 and arr.shape[2] == 3:
                 arr = (0.299*arr[:,:,0]+0.587*arr[:,:,1]+0.114*arr[:,:,2]).astype(np.uint8)
             elif arr.ndim == 3:
                 arr = arr[:,:,0]
             img = arr.astype(np.float32) / 255.0
         else:
+            # PNG may be RGB — convert to grayscale for model
             img_pil = Image.open(p).convert("L")
             img = np.asarray(img_pil, np.float32) / 255.0
         if self.resize:
