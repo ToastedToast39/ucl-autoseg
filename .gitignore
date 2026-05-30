@@ -1,0 +1,7 @@
+subjects/
+_train_seg/
+_train_lm/
+models/*.pt
+__pycache__/
+*.pyc
+.DS_Store
