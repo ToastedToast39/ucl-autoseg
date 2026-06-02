@@ -1,0 +1,969 @@
+import os, sys, json, subprocess, threading, re
+import numpy as np
+from pathlib import Path
+import qt, ctk, slicer
+from slicer.ScriptedLoadableModule import *
+
+PIPELINE = Path.home() / "Desktop" / "ucl_pipeline"
+REPO_URL = "https://github.com/ToastedToast39/ucl-autoseg.git"
+
+def _find_slicer_python():
+    candidates = [
+        Path(sys.executable).parent / "PythonSlicer",
+        Path(sys.executable).parent / "python3",
+        Path(sys.executable).parent / "python",
+        Path("/Applications/Slicer.app/Contents/bin/PythonSlicer"),
+    ]
+    for c in candidates:
+        if c.exists(): return str(c)
+    return sys.executable
+
+_PYTHON = _find_slicer_python()
+
+# Colour map: class id → (R,G,B) 0-1 for Slicer + hex for overlays
+LABEL_COLOURS = {
+    "humerus":         ((1.0, 0.6, 0.0), "#FF9900"),
+    "ulna":            ((0.0, 1.0, 0.0), "#00FF00"),
+    "ucl":             ((1.0, 0.0, 1.0), "#FF00FF"),
+    "flexor_pronator": ((0.0, 1.0, 1.0), "#00FFFF"),
+}
+
+
+class UCLSegmentation(ScriptedLoadableModule):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent.title        = "UCL Segmentation"
+        self.parent.categories   = ["Segmentation"]
+        self.parent.dependencies = []
+        self.parent.contributors = ["UCL Autoseg Pipeline"]
+        self.parent.helpText     = "Automated UCL ultrasound segmentation — label in Slicer, train, infer."
+        self.parent.acknowledgementText = "UCSD MSK Lab"
+
+
+class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
+
+    def setup(self):
+        super().setup()
+        self.logic = UCLSegmentationLogic()
+        self._current_subject  = None
+        self._current_session  = None
+        self._current_img_stem = None
+        self._seg_node         = None
+        self._build_ui()
+
+    def _build_ui(self):
+        BLUE  = "#185FA5"
+        GREEN = "#0F6E56"
+        DARK  = "#333333"
+        RED   = "#8B0000"
+
+        BAR = ("QProgressBar{border:1px solid #555;border-radius:4px;text-align:center;"
+               "color:white;font-size:11px;height:16px;}"
+               "QProgressBar::chunk{background-color:#185FA5;border-radius:3px;}")
+        BAR_G = BAR.replace("#185FA5","#0F6E56")
+
+        def section(title, color=BLUE, collapsed=False):
+            cb = ctk.ctkCollapsibleButton()
+            cb.text = title
+            cb.collapsed = collapsed
+            cb.setStyleSheet(f"ctkCollapsibleButton{{background-color:{color};color:white;"
+                             f"font-weight:bold;font-size:13px;padding:6px;}}")
+            self.layout.addWidget(cb)
+            return cb, qt.QFormLayout(cb)
+
+        def btn(label, color=BLUE, tip=""):
+            b = qt.QPushButton(label)
+            b.setStyleSheet(f"QPushButton{{background-color:{color};color:white;font-weight:bold;"
+                            f"padding:7px 14px;border-radius:5px;font-size:12px;}}"
+                            f"QPushButton:hover{{background-color:{color}CC;}}")
+            b.setToolTip(tip); return b
+
+        def pb(style=BAR):
+            p = qt.QProgressBar(); p.setRange(0,100); p.setValue(0)
+            p.setStyleSheet(style); p.setVisible(False); return p
+
+        def sl():
+            l = qt.QLabel("—"); l.setStyleSheet("color:#555;font-size:11px;padding:2px 4px;")
+            l.setWordWrap(True); return l
+
+        # HEADER
+        h = qt.QLabel("UCL Autosegmentation")
+        h.setStyleSheet("font-size:18px;font-weight:bold;color:#185FA5;padding:10px 0 4px 0;")
+        h.setAlignment(qt.Qt.AlignCenter); self.layout.addWidget(h)
+        s = qt.QLabel("UCSD MSK Lab  ·  github.com/ToastedToast39/ucl-autoseg")
+        s.setStyleSheet("font-size:10px;color:#888;padding-bottom:8px;")
+        s.setAlignment(qt.Qt.AlignCenter); self.layout.addWidget(s)
+
+        # ① AUTH
+        cb0, fl0 = section("① GitHub Authentication", RED)
+        info = qt.QLabel("First time only: enter GitHub credentials.\nToken stored securely and never asked again.")
+        info.setWordWrap(True); info.setStyleSheet("font-size:11px;color:#aaa;padding:4px;")
+        fl0.addRow(info)
+        self._gh_user  = qt.QLineEdit(); self._gh_user.setPlaceholderText("GitHub username"); self._gh_user.setStyleSheet("padding:4px;")
+        self._gh_token = qt.QLineEdit(); self._gh_token.setPlaceholderText("ghp_xxxx…"); self._gh_token.setEchoMode(qt.QLineEdit.Password); self._gh_token.setStyleSheet("padding:4px;")
+        fl0.addRow("Username:", self._gh_user); fl0.addRow("Token:", self._gh_token)
+        self._auth_pb = pb(); btnAuth = btn("Authenticate & Clone / Pull", RED)
+        btnAuth.clicked.connect(self._on_auth); fl0.addRow(btnAuth); fl0.addRow("Progress:", self._auth_pb)
+        self._auth_st = sl(); fl0.addRow("Status:", self._auth_st)
+        if (PIPELINE/".git").exists():
+            cb0.collapsed = True; self._set_status(self._auth_st, "✓ Repo already cloned", "#0F6E56")
+
+        # ② SETUP
+        cb1, fl1 = section("② Setup & Sync", BLUE)
+        self._setup_pb = pb()
+        btnDep = btn("Check & Install Dependencies", BLUE); btnDep.clicked.connect(self._on_setup); fl1.addRow(btnDep)
+        fl1.addRow("Progress:", self._setup_pb)
+        btnPull = btn("Pull Latest from GitHub", DARK); btnPull.clicked.connect(self._on_pull); fl1.addRow(btnPull)
+        self._setup_st = sl(); fl1.addRow("Status:", self._setup_st)
+
+        # ③ SUBJECT / SESSION
+        cb2, fl2 = section("③ Subject & Session", BLUE)
+        self._subj_cb = qt.QComboBox(); self._subj_cb.setStyleSheet("padding:4px;"); self._subj_cb.currentIndexChanged.connect(self._on_subject_changed)
+        self._sess_cb = qt.QComboBox(); self._sess_cb.setStyleSheet("padding:4px;"); self._sess_cb.currentIndexChanged.connect(self._on_session_changed)
+        fl2.addRow("Subject:", self._subj_cb); fl2.addRow("Session:", self._sess_cb)
+        btnRef = btn("Refresh List", "#666"); btnRef.clicked.connect(self._refresh_subjects); fl2.addRow(btnRef)
+
+        btnSetup = btn("Set Up Subjects from pl_data", "#2B5FA5",
+                      "Reads PatientID from every DICOM in pl_data and copies them into the correct subject folders automatically")
+        btnSetup.clicked.connect(self._on_setup_subjects); fl2.addRow(btnSetup)
+        self._setup_subj_pb = pb()
+        fl2.addRow("Progress:", self._setup_subj_pb)
+
+        self._subj_st = sl(); fl2.addRow("Status:", self._subj_st)
+        qt.QTimer.singleShot(1500, self._refresh_subjects)
+
+        # ④ LABEL IN SLICER  ← new primary labeling workflow
+        cb3, fl3 = section("④ Label in Slicer", "#1A5276")
+
+        info3 = qt.QLabel(
+            "Load a DICOM directly, draw segmentations in the Segment Editor, "
+            "then Save Labels. No conversion needed."
+        )
+        info3.setWordWrap(True); info3.setStyleSheet("font-size:11px;color:#aaa;padding:4px;")
+        fl3.addRow(info3)
+
+        # image picker
+        self._img_combo = qt.QComboBox(); self._img_combo.setStyleSheet("padding:4px;")
+        fl3.addRow("Image:", self._img_combo)
+        btnRefImg = btn("Refresh Images", "#444"); btnRefImg.clicked.connect(self._refresh_images); fl3.addRow(btnRefImg)
+
+        btnLoad = btn("Load Image in Viewer", "#1A5276", "Loads DICOM/PNG into Slicer and opens Segment Editor")
+        btnLoad.clicked.connect(self._on_load_for_labeling); fl3.addRow(btnLoad)
+
+        btnSeg = btn("Open Segment Editor", "#2874A6", "Opens Slicer Segment Editor to draw humerus/ulna etc.")
+        btnSeg.clicked.connect(self._on_open_seg_editor); fl3.addRow(btnSeg)
+
+        btnSave = btn("Save Labels from Slicer", "#0F6E56", "Saves current Slicer segmentation as training mask")
+        btnSave.clicked.connect(self._on_save_labels); fl3.addRow(btnSave)
+
+        btnDelete = btn("Delete Labels", "#A32D2D", "Permanently deletes the saved mask for the current image")
+        btnDelete.clicked.connect(self._on_delete_labels); fl3.addRow(btnDelete)
+
+        self._label_st = sl(); fl3.addRow("Status:", self._label_st)
+
+        # ⑤ MANAGE CLASSES
+        cb4, fl4 = section("⑤ Segmentation Classes", BLUE, collapsed=True)
+        self._label_list = qt.QListWidget(); self._label_list.setMaximumHeight(100); self._label_list.setStyleSheet("font-family:monospace;font-size:11px;")
+        fl4.addRow("Current classes:", self._label_list); self._refresh_labels()
+        addRow = qt.QHBoxLayout()
+        self._new_label_edit = qt.QLineEdit(); self._new_label_edit.setPlaceholderText("e.g. ucl or flexor_pronator"); self._new_label_edit.setStyleSheet("padding:4px;")
+        addRow.addWidget(self._new_label_edit)
+        btnAdd = btn("Add Label", GREEN); btnAdd.clicked.connect(self._on_add_label); addRow.addWidget(btnAdd)
+        fl4.addRow("New label:", addRow)
+        self._class_st = sl(); fl4.addRow("Status:", self._class_st)
+
+        # ⑥ QC — review labels before training
+        cb_qc, fl_qc = section("⑥ Quality Control", "#4A235A", collapsed=True)
+
+        qc_info = qt.QLabel(
+            "Review all saved labels before training. "
+            "Flip through labeled images, flag bad ones to re-label."
+        )
+        qc_info.setWordWrap(True); qc_info.setStyleSheet("font-size:11px;color:#aaa;padding:4px;")
+        fl_qc.addRow(qc_info)
+
+        # labeled image count
+        self._qc_count_label = qt.QLabel("—")
+        self._qc_count_label.setStyleSheet("font-size:11px;color:#aaa;padding:2px 4px;")
+        fl_qc.addRow("Labeled images:", self._qc_count_label)
+
+        # navigation row
+        navRow = qt.QHBoxLayout()
+        self._qc_prev_btn = qt.QPushButton("◀ Previous")
+        self._qc_prev_btn.setStyleSheet("QPushButton{background:#4A235A;color:white;font-weight:bold;padding:6px 10px;border-radius:5px;} QPushButton:hover{background:#6C3483;}")
+        self._qc_prev_btn.clicked.connect(self._on_qc_prev)
+        navRow.addWidget(self._qc_prev_btn)
+
+        self._qc_idx_label = qt.QLabel("—")
+        self._qc_idx_label.setAlignment(qt.Qt.AlignCenter)
+        self._qc_idx_label.setStyleSheet("color:#aaa;font-size:11px;")
+        navRow.addWidget(self._qc_idx_label)
+
+        self._qc_next_btn = qt.QPushButton("Next ▶")
+        self._qc_next_btn.setStyleSheet("QPushButton{background:#4A235A;color:white;font-weight:bold;padding:6px 10px;border-radius:5px;} QPushButton:hover{background:#6C3483;}")
+        self._qc_next_btn.clicked.connect(self._on_qc_next)
+        navRow.addWidget(self._qc_next_btn)
+        fl_qc.addRow(navRow)
+
+        # approve / flag row
+        actionRow = qt.QHBoxLayout()
+        btnApprove = qt.QPushButton("✓ Approve")
+        btnApprove.setStyleSheet("QPushButton{background:#0F6E56;color:white;font-weight:bold;padding:6px 14px;border-radius:5px;} QPushButton:hover{background:#1A8A6A;}")
+        btnApprove.clicked.connect(self._on_qc_approve)
+        actionRow.addWidget(btnApprove)
+
+        btnFlag = qt.QPushButton("✗ Flag for Re-label")
+        btnFlag.setStyleSheet("QPushButton{background:#A32D2D;color:white;font-weight:bold;padding:6px 14px;border-radius:5px;} QPushButton:hover{background:#C0392B;}")
+        btnFlag.clicked.connect(self._on_qc_flag)
+        actionRow.addWidget(btnFlag)
+        fl_qc.addRow(actionRow)
+
+        btnStartQC = btn("Start QC Review", "#4A235A", "Load all labeled images for review")
+        btnStartQC.clicked.connect(self._on_start_qc)
+        fl_qc.addRow(btnStartQC)
+
+        self._qc_st = sl(); fl_qc.addRow("Status:", self._qc_st)
+
+        # internal QC state
+        self._qc_images   = []   # list of (img_path, mask_path) tuples
+        self._qc_index    = 0
+        self._qc_approved = set()
+        self._qc_flagged  = set()
+
+        # ⑦ TRAIN
+        cb5, fl5 = section("⑦ Train Model", BLUE, collapsed=True)
+        eRow = qt.QHBoxLayout(); eRow.addWidget(qt.QLabel("Epochs:"))
+        self._epoch_spin = qt.QSpinBox(); self._epoch_spin.setRange(10,500); self._epoch_spin.setValue(80); self._epoch_spin.setStyleSheet("padding:4px;"); eRow.addWidget(self._epoch_spin)
+        fl5.addRow(eRow)
+        self._train_pb = pb(BAR_G); self._train_pb.setVisible(True)
+        btnTrain = btn("Train Segmentation Model", GREEN); btnTrain.clicked.connect(self._on_train); fl5.addRow(btnTrain)
+        fl5.addRow("Progress:", self._train_pb)
+        self._train_st = sl(); fl5.addRow("Status:", self._train_st)
+
+        # ⑧ PRE-LABEL
+        cb6, fl6 = section("⑧ Pre-Label New Images", "#2B5FA5", collapsed=True)
+        self._prelabel_pb = pb()
+        btnPre = btn("Run Pre-Labeling", "#2B5FA5", "Model draws proposals in Slicer — correct and save"); btnPre.clicked.connect(self._on_prelabel); fl6.addRow(btnPre)
+        fl6.addRow("Progress:", self._prelabel_pb)
+        self._prelabel_st = sl(); fl6.addRow("Status:", self._prelabel_st)
+
+        # ⑨ INFER
+        cb7, fl7 = section("⑨ Run Model & View", GREEN, collapsed=True)
+        pRow = qt.QHBoxLayout(); pRow.addWidget(qt.QLabel("px/mm:"))
+        self._px_spin = qt.QDoubleSpinBox(); self._px_spin.setRange(0,100); self._px_spin.setValue(0); self._px_spin.setDecimals(3); self._px_spin.setSpecialValueText("not set"); self._px_spin.setStyleSheet("padding:4px;"); pRow.addWidget(self._px_spin)
+        fl7.addRow(pRow)
+        self._infer_pb = pb(BAR_G)
+        btnInf = btn("Run Segmentation Model", GREEN); btnInf.clicked.connect(self._on_infer); fl7.addRow(btnInf)
+        fl7.addRow("Progress:", self._infer_pb)
+        btnView = btn("Load Result in Viewer", GREEN); btnView.clicked.connect(self._on_load_result); fl7.addRow(btnView)
+        self._infer_st = sl(); fl7.addRow("Status:", self._infer_st)
+
+        # ⑩ PUSH
+        cb8, fl8 = section("⑩ Push to GitHub", DARK, collapsed=True)
+        self._commit_msg = qt.QLineEdit(); self._commit_msg.setText("update labels and results"); self._commit_msg.setStyleSheet("padding:4px;")
+        fl8.addRow("Commit message:", self._commit_msg)
+        btnPush = btn("Commit & Push to GitHub", DARK); btnPush.clicked.connect(self._on_push); fl8.addRow(btnPush)
+        self._git_st = sl(); fl8.addRow("Status:", self._git_st)
+
+        self.layout.addStretch(1)
+
+    # =========================================================================
+    # Helpers
+    # =========================================================================
+
+    def _set_status(self, label, text, color="#555"):
+        label.setText(text); label.setStyleSheet(f"color:{color};font-size:11px;padding:2px 4px;")
+        slicer.app.processEvents()
+
+    def _set_pb(self, bar, val, visible=True):
+        bar.setVisible(visible); bar.setValue(int(val)); slicer.app.processEvents()
+
+    def _run_bg(self, cmd, on_done, on_line=None):
+        def worker():
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, cwd=str(PIPELINE) if PIPELINE.exists() else str(Path.home()))
+            lines = []
+            for line in proc.stdout:
+                lines.append(line.rstrip())
+                if on_line: on_line(line.rstrip())
+            proc.wait(); on_done(proc.returncode, "\n".join(lines))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _py(self): return _PYTHON
+
+    def _refresh_subjects(self):
+        self._subj_cb.clear()
+        d = PIPELINE/"subjects"
+        if d.exists():
+            for s in sorted(d.iterdir()):
+                if s.is_dir(): self._subj_cb.addItem(s.name)
+        if self._subj_cb.count == 0:
+            self._subj_cb.addItem("(no subjects yet)")
+
+    def _on_subject_changed(self):
+        self._current_subject = self._subj_cb.currentText
+        self._sess_cb.clear()
+        if self._current_subject and not self._current_subject.startswith("("):
+            sd = PIPELINE/"subjects"/self._current_subject/"sessions"
+            if sd.exists():
+                for s in sorted(sd.iterdir()):
+                    if s.is_dir(): self._sess_cb.addItem(s.name)
+
+    def _on_session_changed(self):
+        self._current_session = self._sess_cb.currentText
+        self._refresh_images()
+        if self._current_subject and not self._current_subject.startswith("("):
+            mp = PIPELINE/"subjects"/self._current_subject/"subject.json"
+            if mp.exists():
+                try: self._px_spin.setValue(float(json.loads(mp.read_text()).get("px_per_mm") or 0))
+                except Exception: pass
+
+    def _refresh_images(self):
+        self._img_combo.clear()
+        if not self._current_subject or self._current_subject.startswith("("): return
+        if not self._current_session: return
+        img_dir = PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"images"
+        if not img_dir.exists(): return
+        files = (sorted(img_dir.glob("*.dcm")) +
+                 sorted(img_dir.glob("*.png")) +
+                 sorted(img_dir.glob("*.jpg")))
+        mask_dir = PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"masks"
+        for f in files:
+            has_mask = mask_dir.exists() and (
+                (mask_dir/(f.stem+".nii.gz")).exists() or
+                (mask_dir/(f.stem+".png")).exists()
+            )
+            label = f"✓ {f.name}" if has_mask else f.name
+            self._img_combo.addItem(label, f.name)
+
+    def _refresh_labels(self):
+        self._label_list.clear()
+        dp = PIPELINE/"ucl"/"data.py"
+        if not dp.exists(): self._label_list.addItem("Pipeline not found"); return
+        classes = re.findall(r'"(\w+)":\s*(\d+)', dp.read_text())
+        shown = [(n,i) for n,i in classes if n not in ("ucl_humeral","ucl_ulnar")]
+        if not shown: self._label_list.addItem("(no classes yet)")
+        for name, cid in shown:
+            col = LABEL_COLOURS.get(name, (None,"#aaa"))[1]
+            self._label_list.addItem(f"  class {cid}  →  {name}")
+
+    def _current_img_dir(self):
+        if not self._current_subject or not self._current_session: return None
+        return PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"images"
+
+    def _current_mask_dir(self):
+        if not self._current_subject or not self._current_session: return None
+        d = PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"masks"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    # =========================================================================
+    # Actions
+    # =========================================================================
+
+    def _on_auth(self):
+        username = self._gh_user.text.strip(); token = self._gh_token.text.strip()
+        if not username or not token:
+            self._set_status(self._auth_st, "Enter both username and token", "#A32D2D"); return
+        self._set_pb(self._auth_pb, 10)
+        self._set_status(self._auth_st, "Storing credentials…", "#888")
+        try:
+            subprocess.call(["git","config","--global","credential.helper","store"])
+            cp = Path.home()/".git-credentials"
+            lines = [l for l in (cp.read_text() if cp.exists() else "").splitlines() if "github.com" not in l]
+            lines.append(f"https://{username}:{token}@github.com")
+            cp.write_text("\n".join(lines)+"\n"); os.chmod(cp, 0o600)
+        except Exception as e:
+            self._set_status(self._auth_st, f"✗ {e}", "#A32D2D"); self._set_pb(self._auth_pb,0,False); return
+        self._set_pb(self._auth_pb, 40)
+        auth_url = f"https://{username}:{token}@github.com/ToastedToast39/ucl-autoseg.git"
+        if not (PIPELINE/".git").exists():
+            self._set_status(self._auth_st, "Cloning repo…", "#888"); self._set_pb(self._auth_pb,50)
+            cmd = ["git","clone",auth_url,str(PIPELINE)]
+        else:
+            subprocess.call(["git","-C",str(PIPELINE),"remote","set-url","origin",auth_url])
+            self._set_status(self._auth_st,"Pulling latest…","#888"); self._set_pb(self._auth_pb,60)
+            cmd = ["git","-C",str(PIPELINE),"pull"]
+        def done(rc,out):
+            if rc==0:
+                subprocess.call(["git","-C",str(PIPELINE),"remote","set-url","origin",
+                                 "https://github.com/ToastedToast39/ucl-autoseg.git"])
+                self._set_pb(self._auth_pb,100); self._set_status(self._auth_st,"✓ Authenticated. Repo ready.","#0F6E56")
+                self._gh_token.clear(); self._refresh_subjects(); self._refresh_labels()
+            else:
+                self._set_pb(self._auth_pb,0,False); self._set_status(self._auth_st,"✗ Failed — check username and token","#A32D2D"); print(out)
+        self._run_bg(cmd, done)
+
+    def _on_setup(self):
+        self._set_pb(self._setup_pb,5); self._set_status(self._setup_st,"Installing…","#888")
+        pkgs = ["torch","torchvision","--index-url","https://download.pytorch.org/whl/cpu",
+                "pillow","scipy","opencv-python","pydicom","pylibjpeg","pylibjpeg-libjpeg","nibabel"]
+        done_c = [0]
+        def on_line(line):
+            if "installed" in line.lower() or "satisfied" in line.lower():
+                done_c[0]+=1; self._set_pb(self._setup_pb,min(95,5+done_c[0]*15))
+        def done(rc,out):
+            if rc==0: self._set_pb(self._setup_pb,100); self._set_status(self._setup_st,"✓ All dependencies installed","#0F6E56")
+            else: self._set_pb(self._setup_pb,0,False); self._set_status(self._setup_st,"✗ Error","#A32D2D")
+        self._run_bg([self._py(),"-m","pip","install"]+pkgs+["-q"], done, on_line)
+
+    def _on_pull(self):
+        self._set_status(self._setup_st,"Pulling…","#888"); slicer.app.processEvents()
+        try:
+            r = subprocess.run(["git","-C",str(PIPELINE),"pull"],capture_output=True,text=True,timeout=30)
+            out=(r.stdout+r.stderr).strip(); msg=[l for l in out.split("\n") if l.strip()][-1] if out else "Already up to date"
+            self._set_status(self._setup_st,("✓ " if r.returncode==0 else "✗ ")+msg,"#0F6E56" if r.returncode==0 else "#A32D2D")
+            self._refresh_labels()
+        except subprocess.TimeoutExpired: self._set_status(self._setup_st,"✗ Timed out","#A32D2D")
+        except Exception as e: self._set_status(self._setup_st,f"✗ {e}","#A32D2D")
+
+    def _on_export(self):
+        self._set_pb(self._export_pb,5); self._set_status(self._subj_st,"Exporting…","#888")
+        done_c=[0]
+        def on_line(line):
+            done_c[0]+=1; self._set_pb(self._export_pb,min(95,5+done_c[0]))
+            self._set_status(self._subj_st,line[:80],"#888")
+        def done(rc,out):
+            if rc==0: self._set_pb(self._export_pb,100); last=[l for l in out.split("\n") if l.strip()][-1] if out else "Done"; self._set_status(self._subj_st,"✓ "+last,"#0F6E56"); self._refresh_subjects()
+            else: self._set_pb(self._export_pb,0,False); self._set_status(self._subj_st,"✗ Error","#A32D2D"); print(out)
+        self._run_bg([self._py(),str(PIPELINE/"scripts"/"export_for_labeling.py")],done,on_line)
+
+    # ---- LABEL IN SLICER ----
+
+    def _on_load_for_labeling(self):
+        """Load selected image into Slicer viewer ready for segmentation."""
+        img_name = self._img_combo.currentData
+        if not img_name:
+            self._set_status(self._label_st,"Select an image first","#A32D2D"); return
+        img_dir  = self._current_img_dir()
+        mask_dir = self._current_mask_dir()
+        if not img_dir:
+            self._set_status(self._label_st,"Select subject/session first","#A32D2D"); return
+
+        img_path = img_dir / img_name
+        if not img_path.exists():
+            self._set_status(self._label_st,f"Image not found: {img_name}","#A32D2D"); return
+
+        slicer.mrmlScene.Clear(0)
+        self._current_img_stem = img_path.stem
+
+        # load image — let Slicer's built-in loader handle DICOM natively
+        if img_path.suffix.lower() == ".dcm":
+            try:
+                vol = slicer.util.loadVolume(str(img_path),
+                      properties={"singleFile": True})
+                # set window/level from actual pixel range
+                try:
+                    import pydicom
+                    ds  = pydicom.dcmread(str(img_path), force=True)
+                    arr = ds.pixel_array
+                    while arr.ndim > 3:
+                        arr = arr[0] if arr.shape[0]==1 else arr.reshape(arr.shape[-3],arr.shape[-2],arr.shape[-1])
+                    flat = arr.flatten().astype(float)
+                    flat = flat[flat > 5]
+                    if len(flat) > 0:
+                        lo = float(np.percentile(flat, 2))
+                        hi = float(np.percentile(flat, 98))
+                        dn = vol.GetDisplayNode()
+                        if dn:
+                            dn.SetAutoWindowLevel(0)
+                            dn.SetWindowLevelMinMax(lo, hi)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Load error: {e}")
+                vol = slicer.util.loadVolume(str(img_path))
+        else:
+            vol = slicer.util.loadVolume(str(img_path))
+
+        # set as background in all views
+        for view in ("Red","Green","Yellow"):
+            lm = slicer.app.layoutManager().sliceWidget(view).sliceLogic()
+            lm.GetSliceCompositeNode().SetBackgroundVolumeID(vol.GetID())
+        slicer.util.resetSliceViews()
+
+        # create segmentation node with pre-named segments
+        self._seg_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+        self._seg_node.SetName(f"{img_path.stem}_labels")
+        self._seg_node.SetReferenceImageGeometryParameterFromVolumeNode(vol)
+
+        # read current classes from data.py
+        dp = PIPELINE/"ucl"/"data.py"
+        classes = []
+        if dp.exists():
+            classes = [(n,int(i)) for n,i in re.findall(r'"(\w+)":\s*(\d+)', dp.read_text())
+                       if n not in ("ucl_humeral","ucl_ulnar")]
+
+        seg = self._seg_node.GetSegmentation()
+        for name, cid in sorted(classes, key=lambda x: x[1]):
+            seg_id = seg.AddEmptySegment(name, name)
+            col = LABEL_COLOURS.get(name, ((0.8,0.8,0.2),""))[0]
+            seg.GetSegment(seg_id).SetColor(*col)
+
+        # check if labels already exist and load them
+        nii_path = mask_dir / (img_path.stem + ".nii.gz")
+        if nii_path.exists():
+            existing = slicer.util.loadLabelVolume(str(nii_path))
+            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                existing, self._seg_node)
+            slicer.mrmlScene.RemoveNode(existing)
+            self._set_status(self._label_st,
+                             f"✓ Loaded {img_name} with existing labels — edit and save","#0F6E56")
+        else:
+            self._set_status(self._label_st,
+                             f"✓ Loaded {img_name} — draw segments then click Save Labels","#0F6E56")
+
+        # show segmentation in all views
+        self._seg_node.CreateDefaultDisplayNodes()
+        self._seg_node.GetDisplayNode().SetVisibility(True)
+
+    def _on_open_seg_editor(self):
+        """Switch to Segment Editor module."""
+        if self._seg_node is None:
+            self._set_status(self._label_st,"Load an image first","#A32D2D"); return
+        slicer.util.selectModule("SegmentEditor")
+        # set the segmentation node in the editor
+        try:
+            editor = slicer.modules.segmenteditor.widgetRepresentation().self()
+            editor.parameterSetNode.SetAndObserveSegmentationNode(self._seg_node)
+        except Exception:
+            pass
+        self._set_status(self._label_st,"Segment Editor open — draw, then come back and Save Labels","#0F6E56")
+
+    def _on_save_labels(self):
+        """Export current Slicer segmentation as NIfTI mask for training."""
+        if self._seg_node is None or not self._current_img_stem:
+            self._set_status(self._label_st,"Load an image and draw segments first","#A32D2D"); return
+        mask_dir = self._current_mask_dir()
+        if mask_dir is None:
+            self._set_status(self._label_st,"Select subject/session first","#A32D2D"); return
+
+        out_path = mask_dir / (self._current_img_stem + ".nii.gz")
+
+        # export segmentation node → labelmap → NIfTI
+        try:
+            # get reference volume for geometry
+            vol_nodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            ref_vol   = vol_nodes[0] if vol_nodes else None
+
+            lm_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode")
+            lm_node.SetName("tmp_export")
+
+            # read class map to set correct label values
+            dp = PIPELINE/"ucl"/"data.py"
+            classes = {}
+            if dp.exists():
+                classes = {n:int(i) for n,i in re.findall(r'"(\w+)":\s*(\d+)', dp.read_text())
+                           if n not in ("ucl_humeral","ucl_ulnar")}
+
+            seg = self._seg_node.GetSegmentation()
+            # set label values to match class IDs
+            for i in range(seg.GetNumberOfSegments()):
+                seg_id   = seg.GetNthSegmentID(i)
+                seg_name = seg.GetSegment(seg_id).GetName()
+                if seg_name in classes:
+                    seg.GetSegment(seg_id).SetLabelValue(classes[seg_name])
+
+            if ref_vol:
+                slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(
+                    self._seg_node, lm_node, ref_vol)
+            else:
+                slicer.modules.segmentations.logic().ExportAllSegmentsToLabelmapNode(
+                    self._seg_node, lm_node)
+
+            slicer.util.saveNode(lm_node, str(out_path))
+            slicer.mrmlScene.RemoveNode(lm_node)
+
+            self._set_status(self._label_st,
+                             f"✓ Saved labels → {out_path.name}", "#0F6E56")
+            # refresh image list to show ✓ tick
+            self._refresh_images()
+
+        except Exception as e:
+            self._set_status(self._label_st, f"✗ Save failed: {e}", "#A32D2D")
+            print(f"Save labels error: {e}")
+
+    def _on_add_label(self):
+        name = self._new_label_edit.text.strip().lower().replace(" ","_")
+        if not name:
+            self._set_status(self._class_st, "Enter a label name", "#A32D2D"); return
+        dp = PIPELINE/"ucl"/"data.py"
+        if not dp.exists():
+            self._set_status(self._class_st, "Pipeline not found", "#A32D2D"); return
+        txt = dp.read_text()
+        classes = re.findall(r'"(\w+)":\s*(\d+)', txt)
+        seg = [(n,int(i)) for n,i in classes if n not in ("ucl_humeral","ucl_ulnar")]
+        if any(n==name for n,_ in seg):
+            self._set_status(self._class_st, f"'{name}' already exists", "#A32D2D"); return
+        new_id = max((i for _,i in seg), default=0)+1
+        txt = re.sub(r'(SEG_CLASS_MAP\s*:\s*dict[^\{]*\{[^\}]*)\}',
+                     lambda m: m.group(1)+f'    "{name}": {new_id},\n'+'}', txt, flags=re.DOTALL)
+        txt = re.sub(r'NUM_SEG_CLASSES\s*=\s*\d+', f'NUM_SEG_CLASSES = {new_id+1}', txt)
+        dp.write_text(txt)
+        self._new_label_edit.clear()
+        self._refresh_labels()
+        self._set_status(self._class_st, f"✓ Added '{name}' as class {new_id}. Reload image to use it.", "#0F6E56")
+
+    def _on_delete_labels(self):
+        """Delete the saved mask for the currently loaded image."""
+        if not self._current_img_stem:
+            self._set_status(self._label_st, "Load an image first", "#A32D2D"); return
+        mask_dir = self._current_mask_dir()
+        if mask_dir is None:
+            self._set_status(self._label_st, "Select subject/session first", "#A32D2D"); return
+        deleted = False
+        for ext in (".nii.gz", ".png"):
+            p = mask_dir / (self._current_img_stem + ext)
+            if p.exists():
+                p.unlink(); deleted = True
+        if deleted:
+            self._set_status(self._label_st, f"✓ Labels deleted for {self._current_img_stem}", "#0F6E56")
+            self._refresh_images()
+        else:
+            self._set_status(self._label_st, "No saved labels found for this image", "#888")
+
+    def _on_setup_subjects(self):
+        """Read PatientID from every DICOM in pl_data and copy into subject folders."""
+        pl_data = Path.home() / "Desktop" / "pl_data"
+        if not pl_data.exists():
+            self._set_status(self._subj_st,
+                             "pl_data not found on Desktop — add it first", "#A32D2D")
+            return
+        self._set_pb(self._setup_subj_pb, 5)
+        self._set_status(self._subj_st, "Scanning DICOMs…", "#888")
+
+        script = str(PIPELINE / "scripts" / "setup_subjects.py")
+        if not Path(script).exists():
+            # write the script inline if it doesn't exist yet
+            Path(script).write_text('''
+import pydicom, shutil, re, sys
+from pathlib import Path
+
+pl_data  = Path.home() / "Desktop" / "pl_data"
+pipeline = Path(__file__).resolve().parents[1]
+
+def is_dicom(path):
+    try:
+        with open(path,"rb") as f:
+            f.seek(128); return f.read(4)==b"DICM"
+    except: return False
+
+def get_sid(path):
+    try:
+        ds = pydicom.dcmread(str(path), force=True, stop_before_pixels=True)
+        pid = str(ds.get("PatientID","")).strip()
+        if pid and pid not in ("","None"):
+            return re.sub(r"[^\\w\\-]","_",pid).strip("_")
+        pname = str(ds.get("PatientName","")).strip()
+        if pname and pname not in ("","None"):
+            return re.sub(r"[^\\w\\-]","_",pname).strip("_")
+    except: pass
+    return None
+
+copied = skipped = 0
+for sf in sorted(p for p in pl_data.iterdir() if p.is_dir() and p.name.lower().startswith("pl")):
+    for f in sorted(sf.rglob("*")):
+        if not f.is_file(): continue
+        if not (f.suffix.lower()==".dcm" or (f.suffix=="" and is_dicom(f))): continue
+        sid = get_sid(f)
+        if not sid: continue
+        out_dir = pipeline/"subjects"/sid/"sessions"/"session_01"/"images"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dest = out_dir / (f.stem + ".dcm")
+        if dest.exists(): skipped += 1; continue
+        shutil.copy(f, dest); copied += 1
+        print(f"copied {sid}/{dest.name}")
+
+print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
+''')
+
+        done_c = [0]
+        def on_line(line):
+            done_c[0] += 1
+            self._set_pb(self._setup_subj_pb, min(95, 5 + done_c[0]))
+            self._set_status(self._subj_st, line[:80], "#888")
+
+        def done(rc, out):
+            if rc == 0:
+                self._set_pb(self._setup_subj_pb, 100)
+                last = [l for l in out.split("\n") if l.strip()][-1] if out else "Done"
+                self._set_status(self._subj_st, "✓ " + last, "#0F6E56")
+                self._refresh_subjects()
+            else:
+                self._set_pb(self._setup_subj_pb, 0, False)
+                self._set_status(self._subj_st, "✗ Error — see Python console", "#A32D2D")
+                print(out)
+
+        self._run_bg([self._py(), script], done, on_line)
+        name = self._new_label_edit.text.strip().lower().replace(" ","_")
+        if not name: self._set_status(self._class_st,"Enter a label name","#A32D2D"); return
+        dp = PIPELINE/"ucl"/"data.py"
+        if not dp.exists(): self._set_status(self._class_st,"Pipeline not found","#A32D2D"); return
+        txt = dp.read_text()
+        classes = re.findall(r'"(\w+)":\s*(\d+)', txt)
+        seg = [(n,int(i)) for n,i in classes if n not in ("ucl_humeral","ucl_ulnar")]
+        if any(n==name for n,_ in seg): self._set_status(self._class_st,f"'{name}' already exists","#A32D2D"); return
+        new_id = max((i for _,i in seg),default=0)+1
+        txt = re.sub(r'(SEG_CLASS_MAP\s*:\s*dict[^\{]*\{[^\}]*)\}',
+                     lambda m: m.group(1)+f'    "{name}": {new_id},\n'+'}', txt, flags=re.DOTALL)
+        txt = re.sub(r'NUM_SEG_CLASSES\s*=\s*\d+',f'NUM_SEG_CLASSES = {new_id+1}',txt)
+        dp.write_text(txt); self._new_label_edit.clear(); self._refresh_labels()
+        self._set_status(self._class_st,f"✓ Added '{name}' as class {new_id}. Reload image to use it.","#0F6E56")
+
+    def _on_train(self):
+        epochs = self._epoch_spin.value
+        self._set_pb(self._train_pb,0); self._set_status(self._train_st,"Collecting labeled images…","#888")
+        def on_line(line):
+            m = re.search(r'epoch\s+(\d+)',line)
+            if m:
+                self._set_pb(self._train_pb,int(int(m.group(1))/epochs*100))
+                dm = re.search(r'val_dice\s+([\d.]+)',line)
+                self._set_status(self._train_st,f"Epoch {m.group(1)}/{epochs}"+(f"  val_dice:{dm.group(1)}" if dm else ""),"#888")
+        def done(rc,out):
+            if rc==0:
+                m=re.search(r'best val dice\s+([\d.]+)',out)
+                self._set_pb(self._train_pb,100); self._set_status(self._train_st,f"✓ Done. Best val_dice: {m.group(1) if m else '?'}","#0F6E56")
+            else: self._set_pb(self._train_pb,0); self._set_status(self._train_st,"✗ Training failed — see console","#A32D2D")
+            print(out)
+        cmd=[self._py(),str(PIPELINE/"scripts"/"train_seg.py"),
+             "--data",str(PIPELINE/"_train_seg"),"--epochs",str(epochs),
+             "--resize","320","512","--out",str(PIPELINE/"models"/"ucl_seg.pt")]
+        self._set_status(self._train_st,"Training started…","#888"); self._run_bg(cmd,done,on_line)
+
+    def _on_prelabel(self):
+        if not self._current_subject or self._current_subject.startswith("("):
+            self._set_status(self._prelabel_st,"Select a subject first","#A32D2D"); return
+        sm = PIPELINE/"models"/"ucl_seg.pt"
+        if not sm.exists(): self._set_status(self._prelabel_st,"No model — train first","#A32D2D"); return
+        img_dir = PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"images"
+        total = max(len(list(img_dir.glob("*.dcm"))+list(img_dir.glob("*.png"))+list(img_dir.glob("*.jpg"))),1) if img_dir.exists() else 1
+        dc=[0]
+        self._set_pb(self._prelabel_pb,5); self._set_status(self._prelabel_st,"Pre-labeling…","#888")
+        def on_line(line):
+            dc[0]+=1; self._set_pb(self._prelabel_pb,min(95,5+int(dc[0]/total*90)))
+        def done(rc,out):
+            if rc==0: self._set_pb(self._prelabel_pb,100); self._set_status(self._prelabel_st,"✓ Done — load images to review","#0F6E56")
+            else: self._set_pb(self._prelabel_pb,0,False); self._set_status(self._prelabel_st,"✗ Error","#A32D2D"); print(out)
+        lm=PIPELINE/"models"/"ucl_landmarks.pt"
+        self._run_bg([self._py(),str(PIPELINE/"scripts"/"prelabel.py"),
+                      "--seg_model",str(sm),"--lm_model",str(lm) if lm.exists() else str(sm),
+                      "--images",str(img_dir)],done,on_line)
+
+    def _on_infer(self):
+        if not self._current_subject or self._current_subject.startswith("("):
+            self._set_status(self._infer_st,"Select a subject first","#A32D2D"); return
+        sm=PIPELINE/"models"/"ucl_seg.pt"
+        if not sm.exists(): self._set_status(self._infer_st,"No model — train first","#A32D2D"); return
+        img_dir=PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"images"
+        total=max(len(list(img_dir.glob("*.dcm"))+list(img_dir.glob("*.png"))+list(img_dir.glob("*.jpg"))),1) if img_dir.exists() else 1
+        dc=[0]; self._set_pb(self._infer_pb,5); self._set_status(self._infer_st,"Running model…","#888")
+        def on_line(line):
+            dc[0]+=1; self._set_pb(self._infer_pb,min(95,5+int(dc[0]/total*90)))
+            self._set_status(self._infer_st,line[:80],"#888")
+        def done(rc,out):
+            if rc==0: self._set_pb(self._infer_pb,100); self._set_status(self._infer_st,"✓ Done — click Load Result","#0F6E56")
+            else: self._set_pb(self._infer_pb,0,False); self._set_status(self._infer_st,"✗ Error","#A32D2D"); print(out)
+        px=self._px_spin.value
+        cmd=[self._py(),str(PIPELINE/"scripts"/"process_ucl_subject.py"),
+             "--subject",self._current_subject,"--session",self._current_session,"--seg_model",str(sm)]
+        if px>0: cmd+=["--px_per_mm",str(px)]
+        self._run_bg(cmd,done,on_line)
+
+    def _on_load_result(self):
+        if not self._current_subject or self._current_subject.startswith("("):
+            self._set_status(self._infer_st,"Select a subject first","#A32D2D"); return
+        rd=PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"results"
+        id_=PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"images"
+        nf=sorted(rd.glob("*_seg.nii.gz")) if rd.exists() else []
+        if not nf: self._set_status(self._infer_st,"No results yet — run model first","#A32D2D"); return
+        slicer.mrmlScene.Clear(0)
+        sp=nf[0]; stem=sp.name.replace("_seg.nii.gz","")
+        for ext in (".dcm",".png",".jpg"):
+            ip=id_/(stem+ext)
+            if ip.exists(): slicer.util.loadVolume(str(ip)); break
+        sv=slicer.util.loadLabelVolume(str(sp))
+        sn=slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(sv,sn)
+        sn.SetName(f"{stem}_UCL_seg")
+        try:
+            classes=re.findall(r'"(\w+)":\s*(\d+)',(PIPELINE/"ucl"/"data.py").read_text())
+            seg=sn.GetSegmentation()
+            for i in range(seg.GetNumberOfSegments()):
+                sid=seg.GetNthSegmentID(i); name=[n for n,c in classes if int(c)==i+1]
+                col=LABEL_COLOURS.get(name[0] if name else "",((1,1,0),""))[0]
+                seg.GetSegment(sid).SetColor(*col)
+        except Exception as e: print(f"Colour skipped:{e}")
+        slicer.util.resetSliceViews()
+        self._set_status(self._infer_st,f"✓ Loaded {stem} — {len(nf)} result(s)","#0F6E56")
+
+    # ---- QC METHODS ----
+
+    def _collect_labeled_images(self):
+        """Collect all (img_path, mask_path) pairs across all subjects/sessions."""
+        pairs = []
+        subjects_dir = PIPELINE / "subjects"
+        if not subjects_dir.exists(): return pairs
+        for subj in sorted(subjects_dir.iterdir()):
+            if not subj.is_dir(): continue
+            # filter to current subject if one is selected
+            if (self._current_subject and
+                not self._current_subject.startswith("(") and
+                subj.name != self._current_subject):
+                continue
+            for sess in sorted((subj/"sessions").iterdir() if (subj/"sessions").exists() else []):
+                if not sess.is_dir(): continue
+                img_dir  = sess / "images"
+                mask_dir = sess / "masks"
+                if not img_dir.exists() or not mask_dir.exists(): continue
+                for img in sorted(list(img_dir.glob("*.dcm")) +
+                                  list(img_dir.glob("*.png")) +
+                                  list(img_dir.glob("*.jpg"))):
+                    nii = mask_dir / (img.stem + ".nii.gz")
+                    png = mask_dir / (img.stem + ".png")
+                    if nii.exists():
+                        pairs.append((img, nii))
+                    elif png.exists():
+                        pairs.append((img, png))
+        return pairs
+
+    def _on_start_qc(self):
+        """Collect all labeled images and load the first one."""
+        self._qc_images   = self._collect_labeled_images()
+        self._qc_index    = 0
+        self._qc_approved = set()
+        self._qc_flagged  = set()
+
+        if not self._qc_images:
+            self._set_status(self._qc_st,
+                             "No labeled images found. Label some images first.", "#A32D2D")
+            self._qc_count_label.setText("0 labeled")
+            return
+
+        total = len(self._qc_images)
+        self._qc_count_label.setText(f"{total} labeled images")
+        self._set_status(self._qc_st, f"Loaded {total} labeled images — reviewing…", "#888")
+        self._qc_load_current()
+
+    def _qc_load_current(self):
+        """Load the current QC image with its labels into the viewer."""
+        if not self._qc_images: return
+        idx = self._qc_index
+        img_path, mask_path = self._qc_images[idx]
+        total = len(self._qc_images)
+
+        # update index label
+        status = ""
+        if str(img_path) in self._qc_approved: status = "  ✓ Approved"
+        elif str(img_path) in self._qc_flagged: status = "  ✗ Flagged"
+        self._qc_idx_label.setText(f"{idx+1} / {total}{status}")
+
+        # load into viewer
+        slicer.mrmlScene.Clear(0)
+        try:
+            vol = slicer.util.loadVolume(str(img_path))
+            for view in ("Red","Green","Yellow"):
+                lm = slicer.app.layoutManager().sliceWidget(view).sliceLogic()
+                lm.GetSliceCompositeNode().SetBackgroundVolumeID(vol.GetID())
+
+            # load mask
+            seg_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+            seg_node.SetName(f"{img_path.stem}_QC")
+            if mask_path.suffix == ".gz":  # NIfTI
+                lv = slicer.util.loadLabelVolume(str(mask_path))
+                slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(lv, seg_node)
+                slicer.mrmlScene.RemoveNode(lv)
+            else:  # PNG
+                lv = slicer.util.loadLabelVolume(str(mask_path))
+                slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(lv, seg_node)
+                slicer.mrmlScene.RemoveNode(lv)
+
+            # apply colours
+            try:
+                dp = PIPELINE/"ucl"/"data.py"
+                classes = re.findall(r'"(\w+)":\s*(\d+)', dp.read_text()) if dp.exists() else []
+                seg = seg_node.GetSegmentation()
+                for i in range(seg.GetNumberOfSegments()):
+                    sid  = seg.GetNthSegmentID(i)
+                    name = [n for n,c in classes if int(c)==i+1]
+                    col  = LABEL_COLOURS.get(name[0] if name else "", ((0.8,0.8,0.2),""))[0]
+                    seg.GetSegment(sid).SetColor(*col)
+            except Exception: pass
+
+            seg_node.CreateDefaultDisplayNodes()
+            seg_node.GetDisplayNode().SetVisibility(True)
+            slicer.util.resetSliceViews()
+
+            self._set_status(self._qc_st,
+                             f"Viewing: {img_path.parent.parent.parent.name}/"
+                             f"{img_path.parent.parent.name}/{img_path.name}",
+                             "#888")
+        except Exception as e:
+            self._set_status(self._qc_st, f"✗ Could not load: {e}", "#A32D2D")
+
+    def _on_qc_prev(self):
+        if not self._qc_images: return
+        self._qc_index = (self._qc_index - 1) % len(self._qc_images)
+        self._qc_load_current()
+
+    def _on_qc_next(self):
+        if not self._qc_images: return
+        self._qc_index = (self._qc_index + 1) % len(self._qc_images)
+        self._qc_load_current()
+
+    def _on_qc_approve(self):
+        if not self._qc_images: return
+        img_path, _ = self._qc_images[self._qc_index]
+        self._qc_approved.add(str(img_path))
+        self._qc_flagged.discard(str(img_path))
+        approved = len(self._qc_approved)
+        flagged  = len(self._qc_flagged)
+        total    = len(self._qc_images)
+        self._qc_idx_label.setText(f"{self._qc_index+1} / {total}  ✓ Approved")
+        self._set_status(self._qc_st,
+                         f"✓ {approved} approved  ✗ {flagged} flagged  ({total} total)",
+                         "#0F6E56")
+        # auto-advance to next
+        self._qc_index = (self._qc_index + 1) % total
+        self._qc_load_current()
+
+    def _on_qc_flag(self):
+        if not self._qc_images: return
+        img_path, mask_path = self._qc_images[self._qc_index]
+        self._qc_flagged.add(str(img_path))
+        self._qc_approved.discard(str(img_path))
+
+        # move mask to _flagged subfolder to exclude from training
+        if mask_path.exists():
+            flagged_dir = mask_path.parent / "_flagged"
+            flagged_dir.mkdir(exist_ok=True)
+            import shutil
+            shutil.move(str(mask_path), str(flagged_dir / mask_path.name))
+            flag_msg = "mask moved to _flagged/"
+        else:
+            flag_msg = "mask not found — already removed?"
+
+        approved = len(self._qc_approved)
+        flagged  = len(self._qc_flagged)
+        total    = len(self._qc_images)
+        self._qc_idx_label.setText(f"{self._qc_index+1} / {total}  ✗ Flagged")
+        self._set_status(self._qc_st,
+                         f"✗ Flagged ({flag_msg}). "
+                         f"{approved} approved  {flagged} flagged  ({total} total)",
+                         "#A32D2D")
+        self._qc_index = (self._qc_index + 1) % total
+        self._qc_load_current()
+
+    def _on_push(self):
+        msg=self._commit_msg.text.strip() or "update labels and results"
+        self._set_status(self._git_st,"Pushing…","#888"); slicer.app.processEvents()
+        try:
+            r=subprocess.run(["bash","-c",f'cd "{PIPELINE}" && git add subjects/ ucl/data.py && git commit -m "{msg}" && git push'],
+                             capture_output=True,text=True,timeout=30)
+            out=(r.stdout+r.stderr).strip(); last=[l for l in out.split("\n") if l.strip()][-1] if out else "done"
+            self._set_status(self._git_st,("✓ " if r.returncode==0 else "✗ ")+last,"#0F6E56" if r.returncode==0 else "#A32D2D")
+        except subprocess.TimeoutExpired: self._set_status(self._git_st,"✗ Timed out","#A32D2D")
+        except Exception as e: self._set_status(self._git_st,f"✗ {e}","#A32D2D")
+
+
+class UCLSegmentationLogic(ScriptedLoadableModuleLogic):
+    pass
