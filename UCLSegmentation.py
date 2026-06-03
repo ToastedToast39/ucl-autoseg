@@ -113,7 +113,9 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._setup_pb = pb()
         btnDep = btn("Check & Install Dependencies", BLUE); btnDep.clicked.connect(self._on_setup); fl1.addRow(btnDep)
         fl1.addRow("Progress:", self._setup_pb)
-        btnPull = btn("Pull Latest from GitHub", DARK); btnPull.clicked.connect(self._on_pull); fl1.addRow(btnPull)
+        btnPull = btn("Update Everything from GitHub", DARK,
+                      "Pulls latest scripts and auto-updates this Slicer module — no Terminal needed")
+        btnPull.clicked.connect(self._on_pull); fl1.addRow(btnPull)
         self._setup_st = sl(); fl1.addRow("Status:", self._setup_st)
 
         # ③ SUBJECT / SESSION
@@ -235,20 +237,70 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         eRow = qt.QHBoxLayout(); eRow.addWidget(qt.QLabel("Epochs:"))
         self._epoch_spin = qt.QSpinBox(); self._epoch_spin.setRange(10,500); self._epoch_spin.setValue(80); self._epoch_spin.setStyleSheet("padding:4px;"); eRow.addWidget(self._epoch_spin)
         fl5.addRow(eRow)
+
+        # version name field
+        vRow = qt.QHBoxLayout(); vRow.addWidget(qt.QLabel("Version name:"))
+        self._version_name = qt.QLineEdit()
+        import datetime
+        self._version_name.setText(f"v1_{datetime.date.today().strftime('%Y%m%d')}")
+        self._version_name.setStyleSheet("padding:4px;"); vRow.addWidget(self._version_name)
+        fl5.addRow(vRow)
+
         self._train_pb = pb(BAR_G); self._train_pb.setVisible(True)
         btnTrain = btn("Train Segmentation Model", GREEN); btnTrain.clicked.connect(self._on_train); fl5.addRow(btnTrain)
         fl5.addRow("Progress:", self._train_pb)
         self._train_st = sl(); fl5.addRow("Status:", self._train_st)
 
-        # ⑧ PRE-LABEL
-        cb6, fl6 = section("⑧ Pre-Label New Images", "#2B5FA5", collapsed=True)
+        # ⑧ MODEL VERSIONS
+        cb_mv, fl_mv = section("⑧ Model Versions", "#1A5276", collapsed=True)
+
+        mv_info = qt.QLabel(
+            "All trained models are tracked here. Download any version or set it as the active model."
+        )
+        mv_info.setWordWrap(True); mv_info.setStyleSheet("font-size:11px;color:#aaa;padding:4px;")
+        fl_mv.addRow(mv_info)
+
+        self._version_list = qt.QListWidget()
+        self._version_list.setMaximumHeight(140)
+        self._version_list.setStyleSheet("font-family:monospace;font-size:11px;")
+        fl_mv.addRow("Available versions:", self._version_list)
+        self._refresh_versions()
+
+        # drive link field for uploading
+        driveRow = qt.QHBoxLayout()
+        driveRow.addWidget(qt.QLabel("Drive link:"))
+        self._drive_link = qt.QLineEdit()
+        self._drive_link.setPlaceholderText("paste Google Drive share link after uploading")
+        self._drive_link.setStyleSheet("padding:4px;")
+        driveRow.addWidget(self._drive_link)
+        fl_mv.addRow(driveRow)
+
+        btnRegister = btn("Register Trained Model", "#1A5276",
+                          "After training and uploading to Drive, register it here to track the version")
+        btnRegister.clicked.connect(self._on_register_version)
+        fl_mv.addRow(btnRegister)
+
+        btnActivate = btn("Set Selected as Active Model", "#0F6E56",
+                          "Sets the selected version as the model used for pre-labeling and inference")
+        btnActivate.clicked.connect(self._on_activate_version)
+        fl_mv.addRow(btnActivate)
+
+        btnDownload = btn("Download Selected Version", "#2B5FA5",
+                          "Opens the Google Drive link in your browser to download the model")
+        btnDownload.clicked.connect(self._on_download_version)
+        fl_mv.addRow(btnDownload)
+
+        self._mv_st = sl(); fl_mv.addRow("Status:", self._mv_st)
+
+        # ⑨ PRE-LABEL
+        cb6, fl6 = section("⑨ Pre-Label New Images", "#2B5FA5", collapsed=True)
         self._prelabel_pb = pb()
         btnPre = btn("Run Pre-Labeling", "#2B5FA5", "Model draws proposals in Slicer — correct and save"); btnPre.clicked.connect(self._on_prelabel); fl6.addRow(btnPre)
         fl6.addRow("Progress:", self._prelabel_pb)
         self._prelabel_st = sl(); fl6.addRow("Status:", self._prelabel_st)
 
-        # ⑨ INFER
-        cb7, fl7 = section("⑨ Run Model & View", GREEN, collapsed=True)
+        # ⑩ INFER
+        cb7, fl7 = section("⑩ Run Model & View", GREEN, collapsed=True)
         pRow = qt.QHBoxLayout(); pRow.addWidget(qt.QLabel("px/mm:"))
         self._px_spin = qt.QDoubleSpinBox(); self._px_spin.setRange(0,100); self._px_spin.setValue(0); self._px_spin.setDecimals(3); self._px_spin.setSpecialValueText("not set"); self._px_spin.setStyleSheet("padding:4px;"); pRow.addWidget(self._px_spin)
         fl7.addRow(pRow)
@@ -258,12 +310,43 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         btnView = btn("Load Result in Viewer", GREEN); btnView.clicked.connect(self._on_load_result); fl7.addRow(btnView)
         self._infer_st = sl(); fl7.addRow("Status:", self._infer_st)
 
-        # ⑩ PUSH
-        cb8, fl8 = section("⑩ Push to GitHub", DARK, collapsed=True)
-        self._commit_msg = qt.QLineEdit(); self._commit_msg.setText("update labels and results"); self._commit_msg.setStyleSheet("padding:4px;")
+        # ⑪ SYNC
+        cb8, fl8 = section("⑪ Sync Labels & Models", DARK, collapsed=True)
+
+        sync_info = qt.QLabel(
+            "Push your labels to Google Drive so everyone trains on combined data. "
+            "Pull to get your collaborator's latest labels."
+        )
+        sync_info.setWordWrap(True); sync_info.setStyleSheet("font-size:11px;color:#aaa;padding:4px;")
+        fl8.addRow(sync_info)
+
+        self._drive_pb = pb()
+        btnPushDrive = btn("Push Labels to Drive", "#0F6E56",
+                           "Uploads all your .nii.gz mask files to Google Drive UCL Autoseg/labels/")
+        btnPushDrive.clicked.connect(self._on_push_drive); fl8.addRow(btnPushDrive)
+
+        btnPullDrive = btn("Pull Labels from Drive", "#2B5FA5",
+                           "Downloads all collaborator labels from Google Drive to your subjects/ folder")
+        btnPullDrive.clicked.connect(self._on_pull_drive); fl8.addRow(btnPullDrive)
+
+        btnPushModel = btn("Push Model to Drive", "#1A5276",
+                           "Uploads the current ucl_seg.pt to Google Drive UCL Autoseg/models/")
+        btnPushModel.clicked.connect(self._on_push_model_drive); fl8.addRow(btnPushModel)
+
+        btnPullModel = btn("Pull Latest Model from Drive", "#4A235A",
+                           "Downloads the latest model from Google Drive to models/")
+        btnPullModel.clicked.connect(self._on_pull_model_drive); fl8.addRow(btnPullModel)
+
+        fl8.addRow("Progress:", self._drive_pb)
+        self._drive_st = sl(); fl8.addRow("Status:", self._drive_st)
+
+        # GitHub push for scripts only
+        fl8.addRow(qt.QLabel(""))
+        self._commit_msg = qt.QLineEdit(); self._commit_msg.setText("update scripts"); self._commit_msg.setStyleSheet("padding:4px;")
         fl8.addRow("Commit message:", self._commit_msg)
-        btnPush = btn("Commit & Push to GitHub", DARK); btnPush.clicked.connect(self._on_push); fl8.addRow(btnPush)
-        self._git_st = sl(); fl8.addRow("Status:", self._git_st)
+        btnPush = btn("Push Scripts to GitHub", DARK,
+                      "Pushes scripts and data.py to GitHub — not labels or models"); btnPush.clicked.connect(self._on_push); fl8.addRow(btnPush)
+        self._git_st = sl(); fl8.addRow("GitHub status:", self._git_st)
 
         self.layout.addStretch(1)
 
@@ -422,8 +505,21 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         try:
             r = subprocess.run(["git","-C",str(PIPELINE),"pull"],capture_output=True,text=True,timeout=30)
             out=(r.stdout+r.stderr).strip(); msg=[l for l in out.split("\n") if l.strip()][-1] if out else "Already up to date"
-            self._set_status(self._setup_st,("✓ " if r.returncode==0 else "✗ ")+msg,"#0F6E56" if r.returncode==0 else "#A32D2D")
-            self._refresh_labels()
+            if r.returncode==0:
+                # auto-copy updated module file so collaborator never needs Terminal
+                module_src  = PIPELINE / "UCLSegmentation.py"
+                module_dest = Path(__file__)
+                if module_src.exists() and module_src.resolve() != module_dest.resolve():
+                    try:
+                        import shutil
+                        shutil.copy(str(module_src), str(module_dest))
+                        msg += "  |  module updated — restart Slicer to apply"
+                    except Exception as ce:
+                        msg += f"  |  module copy failed: {ce}"
+                self._set_status(self._setup_st,"✓ "+msg,"#0F6E56")
+                self._refresh_labels()
+            else:
+                self._set_status(self._setup_st,"✗ "+msg,"#A32D2D")
         except subprocess.TimeoutExpired: self._set_status(self._setup_st,"✗ Timed out","#A32D2D")
         except Exception as e: self._set_status(self._setup_st,f"✗ {e}","#A32D2D")
 
@@ -720,8 +816,156 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
         dp.write_text(txt); self._new_label_edit.clear(); self._refresh_labels()
         self._set_status(self._class_st,f"✓ Added '{name}' as class {new_id}. Reload image to use it.","#0F6E56")
 
+    # ---- VERSION MANAGEMENT ----
+
+    def _versions_path(self):
+        return PIPELINE / "VERSIONS.json"
+
+    def _load_versions(self):
+        p = self._versions_path()
+        if p.exists():
+            try: return json.loads(p.read_text())
+            except Exception: pass
+        return {"versions": [], "active": None}
+
+    def _save_versions(self, data):
+        self._versions_path().write_text(json.dumps(data, indent=2))
+
+    def _refresh_versions(self):
+        self._version_list.clear()
+        data = self._load_versions()
+        active = data.get("active")
+        versions = data.get("versions", [])
+        if not versions:
+            self._version_list.addItem("  No versions registered yet")
+            return
+        for v in reversed(versions):  # newest first
+            name     = v.get("name","?")
+            date     = v.get("date","?")
+            dice     = v.get("val_dice","?")
+            labels   = v.get("num_labels","?")
+            backbone = v.get("backbone","unet")
+            star     = "★ ACTIVE  " if name == active else "          "
+            self._version_list.addItem(
+                f"{star}{name}   dice:{dice}   labels:{labels}   {backbone}   {date}"
+            )
+
+    def _on_register_version(self):
+        """Register a trained model version with its Drive link."""
+        name = self._version_name.text.strip()
+        if not name:
+            self._set_status(self._mv_st, "Enter a version name first", "#A32D2D"); return
+
+        drive_link = self._drive_link.text.strip()
+        model_path = PIPELINE / "models" / f"ucl_seg_{name}.pt"
+
+        # check if model exists
+        if not model_path.exists():
+            # try default name
+            default = PIPELINE / "models" / "ucl_seg.pt"
+            if default.exists():
+                import shutil, datetime
+                shutil.copy(str(default), str(model_path))
+            else:
+                self._set_status(self._mv_st,
+                                 f"Model file not found: {model_path.name}", "#A32D2D"); return
+
+        # read val_dice from checkpoint
+        val_dice = "?"
+        num_labels = "?"
+        backbone = "unet"
+        try:
+            import torch
+            ck = torch.load(str(model_path), map_location="cpu")
+            val_dice  = f"{ck.get('val_dice', 0):.4f}"
+            backbone  = ck.get("backbone", "unet")
+        except Exception: pass
+
+        # count labeled images
+        try:
+            masks = list((PIPELINE/"subjects").rglob("*.nii.gz"))
+            num_labels = str(len(masks))
+        except Exception: pass
+
+        import datetime
+        entry = {
+            "name":       name,
+            "date":       datetime.date.today().isoformat(),
+            "val_dice":   val_dice,
+            "num_labels": num_labels,
+            "backbone":   backbone,
+            "drive_link": drive_link,
+            "file":       model_path.name,
+        }
+
+        data = self._load_versions()
+        # remove existing entry with same name
+        data["versions"] = [v for v in data["versions"] if v["name"] != name]
+        data["versions"].append(entry)
+        if data["active"] is None:
+            data["active"] = name
+        self._save_versions(data)
+        self._refresh_versions()
+        self._drive_link.clear()
+        self._set_status(self._mv_st,
+                         f"✓ Registered {name} (val_dice: {val_dice}, {num_labels} labels)",
+                         "#0F6E56")
+
+    def _on_activate_version(self):
+        """Set selected version as the active model."""
+        row = self._version_list.currentRow()
+        data = self._load_versions()
+        versions = list(reversed(data.get("versions", [])))
+        if not versions or row < 0 or row >= len(versions):
+            self._set_status(self._mv_st, "Select a version first", "#A32D2D"); return
+
+        selected = versions[row]
+        name = selected["name"]
+        model_file = PIPELINE / "models" / selected.get("file", f"ucl_seg_{name}.pt")
+
+        if not model_file.exists():
+            self._set_status(self._mv_st,
+                             f"Model file not found — download it first", "#A32D2D"); return
+
+        # copy to ucl_seg.pt so inference always uses active model
+        import shutil
+        shutil.copy(str(model_file), str(PIPELINE/"models"/"ucl_seg.pt"))
+
+        data["active"] = name
+        self._save_versions(data)
+        self._refresh_versions()
+        self._set_status(self._mv_st,
+                         f"✓ Active model set to {name}", "#0F6E56")
+
+    def _on_download_version(self):
+        """Open the Drive link for selected version in browser."""
+        row = self._version_list.currentRow()
+        data = self._load_versions()
+        versions = list(reversed(data.get("versions", [])))
+        if not versions or row < 0 or row >= len(versions):
+            self._set_status(self._mv_st, "Select a version first", "#A32D2D"); return
+
+        selected = versions[row]
+        link = selected.get("drive_link","")
+        if not link:
+            self._set_status(self._mv_st,
+                             "No Drive link for this version — ask the lead researcher to add one",
+                             "#A32D2D"); return
+
+        import subprocess
+        subprocess.Popen(["open", link])
+        self._set_status(self._mv_st,
+                         f"✓ Opened Drive link for {selected['name']} — download the .pt file to models/",
+                         "#0F6E56")
+
     def _on_train(self):
-        epochs = self._epoch_spin.value
+        epochs   = self._epoch_spin.value
+        ver_name = self._version_name.text.strip()
+        if not ver_name:
+            import datetime
+            ver_name = f"v1_{datetime.date.today().strftime('%Y%m%d')}"
+        out_path = str(PIPELINE/"models"/f"ucl_seg_{ver_name}.pt")
+
         self._set_pb(self._train_pb,0); self._set_status(self._train_st,"Collecting labeled images…","#888")
         def on_line(line):
             m = re.search(r'epoch\s+(\d+)',line)
@@ -732,12 +976,37 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
         def done(rc,out):
             if rc==0:
                 m=re.search(r'best val dice\s+([\d.]+)',out)
-                self._set_pb(self._train_pb,100); self._set_status(self._train_st,f"✓ Done. Best val_dice: {m.group(1) if m else '?'}","#0F6E56")
-            else: self._set_pb(self._train_pb,0); self._set_status(self._train_st,"✗ Training failed — see console","#A32D2D")
+                dice = m.group(1) if m else "?"
+                self._set_pb(self._train_pb,100)
+                self._set_status(self._train_st,f"✓ Done. Best val_dice: {dice}  →  upload to Drive then register in Panel ⑧","#0F6E56")
+                # also copy to ucl_seg.pt for immediate use
+                import shutil
+                shutil.copy(out_path, str(PIPELINE/"models"/"ucl_seg.pt"))
+                # auto-register version
+                import datetime
+                try:
+                    masks = list((PIPELINE/"subjects").rglob("*.nii.gz"))
+                    num_labels = str(len(masks))
+                except Exception:
+                    num_labels = "?"
+                entry = {
+                    "name": ver_name, "date": datetime.date.today().isoformat(),
+                    "val_dice": dice, "num_labels": num_labels,
+                    "backbone": "unet", "drive_link": "", "file": Path(out_path).name,
+                }
+                vdata = self._load_versions()
+                vdata["versions"] = [v for v in vdata["versions"] if v["name"] != ver_name]
+                vdata["versions"].append(entry)
+                vdata["active"] = ver_name
+                self._save_versions(vdata)
+                self._refresh_versions()
+            else:
+                self._set_pb(self._train_pb,0)
+                self._set_status(self._train_st,"✗ Training failed — see console","#A32D2D")
             print(out)
         cmd=[self._py(),str(PIPELINE/"scripts"/"train_seg.py"),
              "--data",str(PIPELINE/"_train_seg"),"--epochs",str(epochs),
-             "--resize","320","512","--out",str(PIPELINE/"models"/"ucl_seg.pt")]
+             "--resize","320","512","--out",out_path]
         self._set_status(self._train_st,"Training started…","#888"); self._run_bg(cmd,done,on_line)
 
     def _on_prelabel(self):
@@ -963,14 +1232,112 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
         self._qc_index = (self._qc_index + 1) % total
         self._qc_load_current()
 
+    # ---- DRIVE SYNC ----
+
+    DRIVE_REMOTE   = "ucl_drive:UCL Autoseg"
+    DRIVE_LABELS   = "ucl_drive:UCL Autoseg/labels"
+    DRIVE_MODELS   = "ucl_drive:UCL Autoseg/models"
+
+    def _rclone_available(self):
+        """Check if rclone is installed."""
+        for path in ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "rclone"]:
+            try:
+                r = subprocess.run([path, "version"], capture_output=True, timeout=5)
+                if r.returncode == 0:
+                    return path
+            except Exception:
+                pass
+        return None
+
+    def _on_push_drive(self):
+        rclone = self._rclone_available()
+        if not rclone:
+            self._set_status(self._drive_st,
+                             "rclone not found — install from rclone.org", "#A32D2D"); return
+        self._set_pb(self._drive_pb, 10)
+        self._set_status(self._drive_st, "Pushing labels to Drive…", "#888")
+        local = str(PIPELINE / "subjects")
+        cmd = [rclone, "sync", local, self.DRIVE_LABELS,
+               "--include", "*.nii.gz", "--progress"]
+        def done(rc, out):
+            if rc == 0:
+                self._set_pb(self._drive_pb, 100)
+                self._set_status(self._drive_st, "✓ Labels pushed to Drive", "#0F6E56")
+            else:
+                self._set_pb(self._drive_pb, 0, False)
+                self._set_status(self._drive_st, "✗ Push failed — see console", "#A32D2D")
+                print(out)
+        self._run_bg(cmd, done)
+
+    def _on_pull_drive(self):
+        rclone = self._rclone_available()
+        if not rclone:
+            self._set_status(self._drive_st,
+                             "rclone not found — install from rclone.org", "#A32D2D"); return
+        self._set_pb(self._drive_pb, 10)
+        self._set_status(self._drive_st, "Pulling labels from Drive…", "#888")
+        local = str(PIPELINE / "subjects")
+        cmd = [rclone, "sync", self.DRIVE_LABELS, local,
+               "--include", "*.nii.gz", "--progress"]
+        def done(rc, out):
+            if rc == 0:
+                self._set_pb(self._drive_pb, 100)
+                self._set_status(self._drive_st, "✓ Labels pulled from Drive", "#0F6E56")
+                self._refresh_images()
+            else:
+                self._set_pb(self._drive_pb, 0, False)
+                self._set_status(self._drive_st, "✗ Pull failed — see console", "#A32D2D")
+                print(out)
+        self._run_bg(cmd, done)
+
+    def _on_push_model_drive(self):
+        rclone = self._rclone_available()
+        if not rclone:
+            self._set_status(self._drive_st,
+                             "rclone not found", "#A32D2D"); return
+        model = PIPELINE / "models" / "ucl_seg.pt"
+        if not model.exists():
+            self._set_status(self._drive_st, "No model found — train first", "#A32D2D"); return
+        self._set_pb(self._drive_pb, 10)
+        self._set_status(self._drive_st, "Pushing model to Drive…", "#888")
+        cmd = [rclone, "copy", str(model), self.DRIVE_MODELS]
+        def done(rc, out):
+            if rc == 0:
+                self._set_pb(self._drive_pb, 100)
+                self._set_status(self._drive_st, "✓ Model pushed to Drive", "#0F6E56")
+            else:
+                self._set_pb(self._drive_pb, 0, False)
+                self._set_status(self._drive_st, "✗ Push failed — see console", "#A32D2D")
+                print(out)
+        self._run_bg(cmd, done)
+
+    def _on_pull_model_drive(self):
+        rclone = self._rclone_available()
+        if not rclone:
+            self._set_status(self._drive_st,
+                             "rclone not found", "#A32D2D"); return
+        self._set_pb(self._drive_pb, 10)
+        self._set_status(self._drive_st, "Pulling model from Drive…", "#888")
+        local = str(PIPELINE / "models")
+        cmd = [rclone, "copy", self.DRIVE_MODELS, local, "--include", "*.pt"]
+        def done(rc, out):
+            if rc == 0:
+                self._set_pb(self._drive_pb, 100)
+                self._set_status(self._drive_st, "✓ Model pulled from Drive", "#0F6E56")
+                self._refresh_versions()
+            else:
+                self._set_pb(self._drive_pb, 0, False)
+                self._set_status(self._drive_st, "✗ Pull failed — see console", "#A32D2D")
+                print(out)
+        self._run_bg(cmd, done)
+
     def _on_push(self):
-        msg=self._commit_msg.text.strip() or "update labels and results"
-        self._set_status(self._git_st,"Pushing…","#888"); slicer.app.processEvents()
+        msg=self._commit_msg.text.strip() or "update scripts"
+        self._set_status(self._git_st,"Pushing scripts to GitHub…","#888"); slicer.app.processEvents()
         try:
-            # use -f to force-add masks even if previously untracked
+            # only push scripts, data.py, versions — labels go to Drive now
             script = (f'cd "{PIPELINE}" && '
-                      f'git add -f subjects/ && '
-                      f'git add ucl/data.py && '
+                      f'git add UCLSegmentation.py scripts/ ucl/ VERSIONS.json 2>/dev/null; '
                       f'git commit -m "{msg}" && '
                       f'git push')
             r=subprocess.run(["bash","-c",script],
