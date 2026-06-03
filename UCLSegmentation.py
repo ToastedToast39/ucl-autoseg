@@ -396,16 +396,26 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
 
     def _on_setup(self):
         self._set_pb(self._setup_pb,5); self._set_status(self._setup_st,"Installing…","#888")
-        pkgs = ["torch","torchvision","--index-url","https://download.pytorch.org/whl/cpu",
-                "pillow","scipy","opencv-python","pydicom","pylibjpeg","pylibjpeg-libjpeg","nibabel"]
+        # numpy must be downgraded to <2 first — torch 2.2.2 is compiled against numpy 1.x
+        # and will crash with numpy 2.0 even though it appears to import successfully
+        pkgs_numpy = ["numpy<2"]
+        pkgs_main  = ["torch","torchvision","--index-url","https://download.pytorch.org/whl/cpu",
+                      "pillow","scipy","pydicom","nibabel"]
         done_c = [0]
         def on_line(line):
             if "installed" in line.lower() or "satisfied" in line.lower():
-                done_c[0]+=1; self._set_pb(self._setup_pb,min(95,5+done_c[0]*15))
-        def done(rc,out):
+                done_c[0]+=1; self._set_pb(self._setup_pb,min(95,5+done_c[0]*12))
+        def done_main(rc,out):
             if rc==0: self._set_pb(self._setup_pb,100); self._set_status(self._setup_st,"✓ All dependencies installed","#0F6E56")
-            else: self._set_pb(self._setup_pb,0,False); self._set_status(self._setup_st,"✗ Error","#A32D2D")
-        self._run_bg([self._py(),"-m","pip","install"]+pkgs+["-q"], done, on_line)
+            else: self._set_pb(self._setup_pb,0,False); self._set_status(self._setup_st,"✗ Error — see console","#A32D2D")
+            print(out)
+        def done_numpy(rc,out):
+            # after numpy downgrade, install the rest
+            self._set_pb(self._setup_pb,20)
+            self._set_status(self._setup_st,"Installing torch and dependencies…","#888")
+            self._run_bg([self._py(),"-m","pip","install"]+pkgs_main+["-q"], done_main, on_line)
+        self._set_status(self._setup_st,"Downgrading numpy for torch compatibility…","#888")
+        self._run_bg([self._py(),"-m","pip","install"]+pkgs_numpy+["-q"], done_numpy)
 
     def _on_pull(self):
         self._set_status(self._setup_st,"Pulling…","#888"); slicer.app.processEvents()
@@ -957,8 +967,14 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
         msg=self._commit_msg.text.strip() or "update labels and results"
         self._set_status(self._git_st,"Pushing…","#888"); slicer.app.processEvents()
         try:
-            r=subprocess.run(["bash","-c",f'cd "{PIPELINE}" && git add subjects/ ucl/data.py && git commit -m "{msg}" && git push'],
-                             capture_output=True,text=True,timeout=30)
+            # use -f to force-add masks even if previously untracked
+            script = (f'cd "{PIPELINE}" && '
+                      f'git add -f subjects/ && '
+                      f'git add ucl/data.py && '
+                      f'git commit -m "{msg}" && '
+                      f'git push')
+            r=subprocess.run(["bash","-c",script],
+                             capture_output=True,text=True,timeout=60)
             out=(r.stdout+r.stderr).strip(); last=[l for l in out.split("\n") if l.strip()][-1] if out else "done"
             self._set_status(self._git_st,("✓ " if r.returncode==0 else "✗ ")+last,"#0F6E56" if r.returncode==0 else "#A32D2D")
         except subprocess.TimeoutExpired: self._set_status(self._git_st,"✗ Timed out","#A32D2D")

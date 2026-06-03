@@ -41,7 +41,8 @@ def val_dice(model, loader, device, nc):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data",        required=True)
+    ap.add_argument("--data",        default=str(Path(__file__).resolve().parents[1]/"_train_seg"),
+                    help="training data root (auto-built from subjects/ if not specified)")
     ap.add_argument("--epochs",      type=int,   default=80)
     ap.add_argument("--batch",       type=int,   default=4)
     ap.add_argument("--lr",          type=float, default=1e-3)
@@ -52,9 +53,26 @@ def main():
                     metavar=("H", "W"))
     ap.add_argument("--out",         default="models/ucl_seg.pt")
     ap.add_argument("--seed",        type=int,   default=0)
+    ap.add_argument("--backbone",    default="unet", choices=["unet","ultrasam"],
+                    help="unet = train from scratch (default). "
+                         "ultrasam = UltraSam ViT encoder + U-Net decoder.")
+    ap.add_argument("--ultrasam_ckpt", default="models/UltraSam.pth",
+                    help="path to UltraSam.pth (only with --backbone ultrasam)")
+    ap.add_argument("--freeze_epochs", type=int, default=20,
+                    help="epochs to freeze UltraSam encoder before full fine-tune")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
+
+    # auto-build training set from subjects/ folder
+    import importlib.util
+    bts_path = Path(__file__).resolve().parent / "build_training_set.py"
+    if bts_path.exists():
+        spec = importlib.util.spec_from_file_location("build_training_set", bts_path)
+        bts  = importlib.util.module_from_spec(spec); spec.loader.exec_module(bts)
+        n = bts.main()
+        if not n:
+            raise SystemExit("No labeled images found. Label images in Slicer first.")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device}")
 
@@ -70,16 +88,47 @@ def main():
     va = torch.utils.data.Subset(full_va, list(vi))
     print(f"train {len(tr)}  val {len(va)}  classes {nc}")
 
-    tl = DataLoader(tr, batch_size=args.batch, shuffle=True,  num_workers=2)
-    vl = DataLoader(va, batch_size=1,          shuffle=False, num_workers=2)
+    tl = DataLoader(tr, batch_size=args.batch, shuffle=True,  num_workers=0)
+    vl = DataLoader(va, batch_size=1,          shuffle=False, num_workers=0)
 
-    model = UNet(in_ch=1, out_ch=nc, base=args.base).to(device)
-    opt   = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # ---- model selection ----
+    if args.backbone == "ultrasam":
+        from ucl.model import UltraSamUNet
+        ckpt_path = Path(args.ultrasam_ckpt)
+        if not ckpt_path.exists():
+            raise SystemExit(
+                f"UltraSam checkpoint not found: {ckpt_path}\n"
+                f"Download it with:\n"
+                f"  curl -L -o {ckpt_path} "
+                f"https://s3.unistra.fr/camma_public/github/ultrasam/UltraSam.pth"
+            )
+        print(f"Using UltraSam backbone from {ckpt_path}")
+        print(f"  Phase A: encoder frozen for {args.freeze_epochs} epochs")
+        print(f"  Phase B: full fine-tune for {args.epochs - args.freeze_epochs} epochs")
+        model = UltraSamUNet(checkpoint=str(ckpt_path), out_ch=nc,
+                             freeze_encoder=True).to(device)
+        backbone_tag = "ultrasam"
+    else:
+        model = UNet(in_ch=1, out_ch=nc, base=args.base).to(device)
+        backbone_tag = "unet"
+
+    opt   = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     best = -1.0
     for ep in range(1, args.epochs+1):
+
+        # Phase B: unfreeze encoder after freeze_epochs
+        if args.backbone == "ultrasam" and ep == args.freeze_epochs + 1:
+            print(f"\n--- Phase B: unfreezing UltraSam encoder ---")
+            model.unfreeze_encoder()
+            # rebuild optimizer to include encoder params
+            opt = torch.optim.Adam(model.parameters(), lr=args.lr * 0.1)
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=args.epochs - args.freeze_epochs)
+
         model.train(); losses = []
         for img, msk in tl:
             img, msk = img.to(device), msk.to(device)
@@ -89,12 +138,14 @@ def main():
             losses.append(loss.item())
         sched.step()
         d = val_dice(model, vl, device, nc)
-        print(f"epoch {ep:3d}  loss {np.mean(losses):.4f}  val_dice {d:.4f}")
+        phase = "A" if (args.backbone=="ultrasam" and ep<=args.freeze_epochs) else "B"
+        print(f"epoch {ep:3d} [{phase}]  loss {np.mean(losses):.4f}  val_dice {d:.4f}")
         if d > best:
             best = d
             torch.save({"model": model.state_dict(), "base": args.base,
                         "num_classes": nc, "resize": resize,
-                        "val_dice": best, "task": "segmentation"}, args.out)
+                        "val_dice": best, "task": "segmentation",
+                        "backbone": backbone_tag}, args.out)
             print(f"  saved → {args.out}  (dice {best:.4f})")
     print(f"\ndone. best val dice {best:.4f}")
 
