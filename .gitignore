@@ -1,6 +1,4 @@
-subjects/*/sessions/*/images/*.png
-subjects/*/sessions/*/images/*.dcm
-subjects/*/sessions/*/results/
+subjects/
 _train_seg/
 _train_lm/
 models/*.pt
