@@ -94,7 +94,7 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         s.setStyleSheet("font-size:10px;color:#888;padding-bottom:8px;")
         s.setAlignment(qt.Qt.AlignCenter); self.layout.addWidget(s)
 
-        # ① AUTH
+        # ① AUTH (always visible until authenticated)
         cb0, fl0 = section("① GitHub Authentication", RED)
         info = qt.QLabel("First time only: enter GitHub credentials.\nToken stored securely and never asked again.")
         info.setWordWrap(True); info.setStyleSheet("font-size:11px;color:#aaa;padding:4px;")
@@ -108,34 +108,48 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         if (PIPELINE/".git").exists():
             cb0.collapsed = True; self._set_status(self._auth_st, "✓ Repo already cloned", "#0F6E56")
 
-        # ② SETUP
-        cb1, fl1 = section("② Setup & Sync", BLUE)
-        self._setup_pb = pb()
-        btnDep = btn("Check & Install Dependencies", BLUE); btnDep.clicked.connect(self._on_setup); fl1.addRow(btnDep)
-        fl1.addRow("Progress:", self._setup_pb)
-        btnPull = btn("Update Everything from GitHub", DARK,
-                      "Pulls latest scripts and auto-updates this Slicer module — no Terminal needed")
+        # ② DAILY — update and sync (always visible)
+        cb1, fl1 = section("② Daily Sync", BLUE)
+        btnPull = btn("Update Everything from GitHub", BLUE,
+                      "Pulls latest scripts and auto-updates this Slicer module")
         btnPull.clicked.connect(self._on_pull); fl1.addRow(btnPull)
         self._setup_st = sl(); fl1.addRow("Status:", self._setup_st)
 
-        # ③ SUBJECT / SESSION
-        cb2, fl2 = section("③ Subject & Session", BLUE)
+        # ③ ONE-TIME SETUP (collapsed by default)
+        cb_ots, fl_ots = section("③ One-Time Setup", "#555555", collapsed=True)
+        ots_info = qt.QLabel("Run these once when first setting up. Collapse this panel after setup is complete.")
+        ots_info.setWordWrap(True); ots_info.setStyleSheet("font-size:11px;color:#aaa;padding:4px;")
+        fl_ots.addRow(ots_info)
+
+        self._setup_pb = pb()
+        btnDep = btn("Check & Install Dependencies", "#555555",
+                     "Installs torch, nibabel etc into Slicer Python — run once")
+        btnDep.clicked.connect(self._on_setup); fl_ots.addRow(btnDep)
+        fl_ots.addRow("Progress:", self._setup_pb)
+
+        btnDriveSetup = btn("Set Up Google Drive Sync", "#555555",
+                            "Installs rclone and configures Google Drive — run once")
+        btnDriveSetup.clicked.connect(self._on_setup_drive); fl_ots.addRow(btnDriveSetup)
+
+        self._setup_subj_pb = pb()
+        btnSetupSubj = btn("Set Up Subjects from pl_data", "#555555",
+                           "Reads PatientID from DICOMs and copies into subject folders — run once, and when new data added")
+        btnSetupSubj.clicked.connect(self._on_setup_subjects); fl_ots.addRow(btnSetupSubj)
+        fl_ots.addRow("Progress:", self._setup_subj_pb)
+
+        self._ots_st = sl(); fl_ots.addRow("Status:", self._ots_st)
+
+        # ④ SUBJECT / SESSION
+        cb2, fl2 = section("④ Subject & Session", BLUE)
         self._subj_cb = qt.QComboBox(); self._subj_cb.setStyleSheet("padding:4px;"); self._subj_cb.currentIndexChanged.connect(self._on_subject_changed)
         self._sess_cb = qt.QComboBox(); self._sess_cb.setStyleSheet("padding:4px;"); self._sess_cb.currentIndexChanged.connect(self._on_session_changed)
         fl2.addRow("Subject:", self._subj_cb); fl2.addRow("Session:", self._sess_cb)
         btnRef = btn("Refresh List", "#666"); btnRef.clicked.connect(self._refresh_subjects); fl2.addRow(btnRef)
-
-        btnSetup = btn("Set Up Subjects from pl_data", "#2B5FA5",
-                      "Reads PatientID from every DICOM in pl_data and copies them into the correct subject folders automatically")
-        btnSetup.clicked.connect(self._on_setup_subjects); fl2.addRow(btnSetup)
-        self._setup_subj_pb = pb()
-        fl2.addRow("Progress:", self._setup_subj_pb)
-
         self._subj_st = sl(); fl2.addRow("Status:", self._subj_st)
         qt.QTimer.singleShot(1500, self._refresh_subjects)
 
         # ④ LABEL IN SLICER  ← new primary labeling workflow
-        cb3, fl3 = section("④ Label in Slicer", "#1A5276")
+        cb3, fl3 = section("⑤ Label in Slicer", "#1A5276")
 
         info3 = qt.QLabel(
             "Load a DICOM directly, draw segmentations in the Segment Editor, "
@@ -164,7 +178,7 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._label_st = sl(); fl3.addRow("Status:", self._label_st)
 
         # ⑤ MANAGE CLASSES
-        cb4, fl4 = section("⑤ Segmentation Classes", BLUE, collapsed=True)
+        cb4, fl4 = section("⑥ Segmentation Classes", BLUE, collapsed=True)
         self._label_list = qt.QListWidget(); self._label_list.setMaximumHeight(100); self._label_list.setStyleSheet("font-family:monospace;font-size:11px;")
         fl4.addRow("Current classes:", self._label_list); self._refresh_labels()
         addRow = qt.QHBoxLayout()
@@ -175,7 +189,7 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._class_st = sl(); fl4.addRow("Status:", self._class_st)
 
         # ⑥ QC — review labels before training
-        cb_qc, fl_qc = section("⑥ Quality Control", "#4A235A", collapsed=True)
+        cb_qc, fl_qc = section("⑦ Quality Control", "#4A235A", collapsed=True)
 
         qc_info = qt.QLabel(
             "Review all saved labels before training. "
@@ -233,7 +247,7 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._qc_flagged  = set()
 
         # ⑦ TRAIN
-        cb5, fl5 = section("⑦ Train Model", BLUE, collapsed=True)
+        cb5, fl5 = section("⑧ Train Model", BLUE, collapsed=True)
         eRow = qt.QHBoxLayout(); eRow.addWidget(qt.QLabel("Epochs:"))
         self._epoch_spin = qt.QSpinBox(); self._epoch_spin.setRange(10,500); self._epoch_spin.setValue(80); self._epoch_spin.setStyleSheet("padding:4px;"); eRow.addWidget(self._epoch_spin)
         fl5.addRow(eRow)
@@ -252,7 +266,7 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._train_st = sl(); fl5.addRow("Status:", self._train_st)
 
         # ⑧ MODEL VERSIONS
-        cb_mv, fl_mv = section("⑧ Model Versions", "#1A5276", collapsed=True)
+        cb_mv, fl_mv = section("⑨ Model Versions", "#1A5276", collapsed=True)
 
         mv_info = qt.QLabel(
             "All trained models are tracked here. Download any version or set it as the active model."
@@ -293,14 +307,14 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._mv_st = sl(); fl_mv.addRow("Status:", self._mv_st)
 
         # ⑨ PRE-LABEL
-        cb6, fl6 = section("⑨ Pre-Label New Images", "#2B5FA5", collapsed=True)
+        cb6, fl6 = section("⑩ Pre-Label New Images", "#2B5FA5", collapsed=True)
         self._prelabel_pb = pb()
         btnPre = btn("Run Pre-Labeling", "#2B5FA5", "Model draws proposals in Slicer — correct and save"); btnPre.clicked.connect(self._on_prelabel); fl6.addRow(btnPre)
         fl6.addRow("Progress:", self._prelabel_pb)
         self._prelabel_st = sl(); fl6.addRow("Status:", self._prelabel_st)
 
         # ⑩ INFER
-        cb7, fl7 = section("⑩ Run Model & View", GREEN, collapsed=True)
+        cb7, fl7 = section("⑪ Run Model & View", GREEN, collapsed=True)
         pRow = qt.QHBoxLayout(); pRow.addWidget(qt.QLabel("px/mm:"))
         self._px_spin = qt.QDoubleSpinBox(); self._px_spin.setRange(0,100); self._px_spin.setValue(0); self._px_spin.setDecimals(3); self._px_spin.setSpecialValueText("not set"); self._px_spin.setStyleSheet("padding:4px;"); pRow.addWidget(self._px_spin)
         fl7.addRow(pRow)
@@ -311,7 +325,7 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._infer_st = sl(); fl7.addRow("Status:", self._infer_st)
 
         # ⑪ SYNC
-        cb8, fl8 = section("⑪ Sync Labels & Models", DARK, collapsed=True)
+        cb8, fl8 = section("⑫ Sync Labels & Models", DARK, collapsed=True)
 
         sync_info = qt.QLabel(
             "Push your labels to Google Drive so everyone trains on combined data. "
@@ -524,14 +538,14 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         except Exception as e: self._set_status(self._setup_st,f"✗ {e}","#A32D2D")
 
     def _on_export(self):
-        self._set_pb(self._export_pb,5); self._set_status(self._subj_st,"Exporting…","#888")
+        self._set_pb(self._export_pb,5); self._set_status(self._ots_st,"Exporting…","#888")
         done_c=[0]
         def on_line(line):
             done_c[0]+=1; self._set_pb(self._export_pb,min(95,5+done_c[0]))
-            self._set_status(self._subj_st,line[:80],"#888")
+            self._set_status(self._ots_st,line[:80],"#888")
         def done(rc,out):
-            if rc==0: self._set_pb(self._export_pb,100); last=[l for l in out.split("\n") if l.strip()][-1] if out else "Done"; self._set_status(self._subj_st,"✓ "+last,"#0F6E56"); self._refresh_subjects()
-            else: self._set_pb(self._export_pb,0,False); self._set_status(self._subj_st,"✗ Error","#A32D2D"); print(out)
+            if rc==0: self._set_pb(self._export_pb,100); last=[l for l in out.split("\n") if l.strip()][-1] if out else "Done"; self._set_status(self._ots_st,"✓ "+last,"#0F6E56"); self._refresh_subjects()
+            else: self._set_pb(self._export_pb,0,False); self._set_status(self._ots_st,"✗ Error","#A32D2D"); print(out)
         self._run_bg([self._py(),str(PIPELINE/"scripts"/"export_for_labeling.py")],done,on_line)
 
     # ---- LABEL IN SLICER ----
@@ -732,11 +746,11 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         """Read PatientID from every DICOM in pl_data and copy into subject folders."""
         pl_data = Path.home() / "Desktop" / "pl_data"
         if not pl_data.exists():
-            self._set_status(self._subj_st,
+            self._set_status(self._ots_st,
                              "pl_data not found on Desktop — add it first", "#A32D2D")
             return
         self._set_pb(self._setup_subj_pb, 5)
-        self._set_status(self._subj_st, "Scanning DICOMs…", "#888")
+        self._set_status(self._ots_st, "Scanning DICOMs…", "#888")
 
         script = str(PIPELINE / "scripts" / "setup_subjects.py")
         if not Path(script).exists():
@@ -787,17 +801,17 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
         def on_line(line):
             done_c[0] += 1
             self._set_pb(self._setup_subj_pb, min(95, 5 + done_c[0]))
-            self._set_status(self._subj_st, line[:80], "#888")
+            self._set_status(self._ots_st, line[:80], "#888")
 
         def done(rc, out):
             if rc == 0:
                 self._set_pb(self._setup_subj_pb, 100)
                 last = [l for l in out.split("\n") if l.strip()][-1] if out else "Done"
-                self._set_status(self._subj_st, "✓ " + last, "#0F6E56")
+                self._set_status(self._ots_st, "✓ " + last, "#0F6E56")
                 self._refresh_subjects()
             else:
                 self._set_pb(self._setup_subj_pb, 0, False)
-                self._set_status(self._subj_st, "✗ Error — see Python console", "#A32D2D")
+                self._set_status(self._ots_st, "✗ Error — see Python console", "#A32D2D")
                 print(out)
 
         self._run_bg([self._py(), script], done, on_line)
@@ -1248,6 +1262,100 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
             except Exception:
                 pass
         return None
+
+    def _on_setup_drive(self):
+        """Install rclone and configure Google Drive — no Terminal needed."""
+        self._set_status(self._setup_st, "Checking rclone…", "#888")
+        slicer.app.processEvents()
+
+        # check if already configured
+        rclone = self._rclone_available()
+        if rclone:
+            # check if ucl_drive remote exists
+            r = subprocess.run([rclone, "listremotes"], capture_output=True, text=True)
+            if "ucl_drive:" in r.stdout:
+                self._set_status(self._setup_st,
+                                 "✓ Google Drive already configured — ready to sync", "#0F6E56")
+                return
+
+        # Step 1 — install rclone if missing
+        if not rclone:
+            self._set_status(self._setup_st, "Installing rclone…", "#888")
+            slicer.app.processEvents()
+            # detect architecture
+            import platform
+            arch = "arm64" if platform.machine() == "arm64" else "amd64"
+            dl_url = f"https://downloads.rclone.org/rclone-current-osx-{arch}.zip"
+            install_script = f"""
+set -e
+cd /tmp
+curl -O -L "{dl_url}"
+unzip -o rclone-current-osx-{arch}.zip
+sudo cp rclone-*-osx-{arch}/rclone /usr/local/bin/rclone
+sudo chmod 755 /usr/local/bin/rclone
+echo "rclone installed"
+"""
+            r = subprocess.run(["bash", "-c", install_script],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                # try homebrew as fallback
+                r2 = subprocess.run(["/opt/homebrew/bin/brew", "install", "rclone"],
+                                    capture_output=True, text=True, timeout=300)
+                if r2.returncode != 0:
+                    self._set_status(self._setup_st,
+                                     "✗ Could not install rclone automatically. "
+                                     "Ask the lead researcher for help.", "#A32D2D")
+                    return
+            rclone = self._rclone_available()
+            if not rclone:
+                self._set_status(self._setup_st,
+                                 "✗ rclone install failed", "#A32D2D"); return
+
+        # Step 2 — configure ucl_drive remote via browser auth
+        self._set_status(self._setup_st,
+                         "Opening browser for Google Drive authorization — "
+                         "sign in and click Allow, then come back here…", "#888")
+        slicer.app.processEvents()
+
+        # run rclone authorize in background, open browser
+        auth_script = f"""
+{rclone} config create ucl_drive drive scope drive 2>&1
+"""
+        # open the auth URL directly in browser
+        try:
+            subprocess.Popen(["bash", "-c",
+                              f"{rclone} config reconnect ucl_drive: --auto-confirm 2>&1 &"])
+        except Exception:
+            pass
+
+        # show instructions popup
+        msg_box = qt.QMessageBox()
+        msg_box.setWindowTitle("Google Drive Authorization")
+        msg_box.setText(
+            "A browser window should open.\n\n"
+            "1. Sign in with your Google account\n"
+            "2. Click Allow\n"
+            "3. Close the browser tab\n"
+            "4. Click OK here when done"
+        )
+        msg_box.exec_()
+
+        # verify it worked
+        r = subprocess.run([rclone, "listremotes"],
+                           capture_output=True, text=True, timeout=10)
+        if "ucl_drive:" in r.stdout:
+            self._set_status(self._setup_st,
+                             "✓ Google Drive configured — Drive sync buttons now active",
+                             "#0F6E56")
+        else:
+            # try creating the remote config directly
+            config_script = f"""
+{rclone} config create ucl_drive drive --non-interactive 2>&1 || true
+"""
+            subprocess.run(["bash", "-c", config_script], timeout=10)
+            self._set_status(self._setup_st,
+                             "Please try clicking Set Up Google Drive Sync again "
+                             "and complete the browser authorization", "#888")
 
     def _on_push_drive(self):
         rclone = self._rclone_available()
