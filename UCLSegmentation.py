@@ -1271,91 +1271,90 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
         # check if already configured
         rclone = self._rclone_available()
         if rclone:
-            # check if ucl_drive remote exists
             r = subprocess.run([rclone, "listremotes"], capture_output=True, text=True)
             if "ucl_drive:" in r.stdout:
                 self._set_status(self._setup_st,
                                  "✓ Google Drive already configured — ready to sync", "#0F6E56")
                 return
 
-        # Step 1 — install rclone if missing
+        # Step 1 — rclone must be installed via Terminal (requires sudo, cannot do from Slicer)
         if not rclone:
-            self._set_status(self._setup_st, "Installing rclone…", "#888")
-            slicer.app.processEvents()
-            # detect architecture
-            import platform
-            arch = "arm64" if platform.machine() == "arm64" else "amd64"
-            dl_url = f"https://downloads.rclone.org/rclone-current-osx-{arch}.zip"
-            install_script = f"""
-set -e
-cd /tmp
-curl -O -L "{dl_url}"
-unzip -o rclone-current-osx-{arch}.zip
-sudo cp rclone-*-osx-{arch}/rclone /usr/local/bin/rclone
-sudo chmod 755 /usr/local/bin/rclone
-echo "rclone installed"
-"""
-            r = subprocess.run(["bash", "-c", install_script],
-                               capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                # try homebrew as fallback
-                r2 = subprocess.run(["/opt/homebrew/bin/brew", "install", "rclone"],
-                                    capture_output=True, text=True, timeout=300)
-                if r2.returncode != 0:
-                    self._set_status(self._setup_st,
-                                     "✗ Could not install rclone automatically. "
-                                     "Ask the lead researcher for help.", "#A32D2D")
-                    return
-            rclone = self._rclone_available()
-            if not rclone:
-                self._set_status(self._setup_st,
-                                 "✗ rclone install failed", "#A32D2D"); return
+            msg_box = qt.QMessageBox()
+            msg_box.setWindowTitle("Install rclone First")
+            msg_box.setText(
+                "rclone is not installed yet.\n\n"
+                "Please do this once:\n\n"
+                "1. Open Terminal (Cmd+Space, type Terminal, press Enter)\n"
+                "2. Paste this command and press Enter:\n\n"
+                "   curl https://rclone.org/install.sh | sudo bash\n\n"
+                "3. Enter your Mac password when asked\n"
+                "4. Come back to Slicer and click this button again\n\n"
+                "(The install command has been copied to your clipboard)"
+            )
+            msg_box.setStandardButtons(qt.QMessageBox.Ok)
+            try:
+                qt.QApplication.clipboard().setText("curl https://rclone.org/install.sh | sudo bash")
+            except Exception:
+                pass
+            self._set_status(self._setup_st,
+                             "Open Terminal and run: curl https://rclone.org/install.sh | sudo bash",
+                             "#A32D2D")
+            msg_box.exec_()
+            return
 
-        # Step 2 — configure ucl_drive remote via browser auth
+        # Step 2 — authorize via rclone authorize (correct headless flow)
+        # rclone authorize opens a browser, captures the token, and prints it.
+        # We run it in a visible Terminal window so the token can be captured.
         self._set_status(self._setup_st,
-                         "Opening browser for Google Drive authorization — "
-                         "sign in and click Allow, then come back here…", "#888")
+                         "Opening Terminal for Google Drive authorization — "
+                         "sign in, then paste the token back here…", "#888")
         slicer.app.processEvents()
 
-        # run rclone authorize in background, open browser
-        auth_script = f"""
-{rclone} config create ucl_drive drive scope drive 2>&1
-"""
-        # open the auth URL directly in browser
+        # Launch rclone authorize in a new Terminal window
+        auth_cmd = f'{rclone} authorize "drive"'
         try:
-            subprocess.Popen(["bash", "-c",
-                              f"{rclone} config reconnect ucl_drive: --auto-confirm 2>&1 &"])
+            subprocess.Popen(["osascript", "-e",
+                              f'tell application "Terminal" to do script "{auth_cmd}"'])
         except Exception:
             pass
 
-        # show instructions popup
-        msg_box = qt.QMessageBox()
-        msg_box.setWindowTitle("Google Drive Authorization")
-        msg_box.setText(
-            "A browser window should open.\n\n"
-            "1. Sign in with your Google account\n"
+        # Ask user to paste the token
+        token_dialog = qt.QInputDialog()
+        token_dialog.setWindowTitle("Paste rclone Token")
+        token_dialog.setLabelText(
+            "A Terminal window opened and ran:\n"
+            f"  {auth_cmd}\n\n"
+            "1. Sign in to Google in the browser that opened\n"
             "2. Click Allow\n"
-            "3. Close the browser tab\n"
-            "4. Click OK here when done"
+            "3. Copy the token JSON that Terminal printed (starts with {\"access_token\"...})\n"
+            "4. Paste it below and click OK"
         )
-        msg_box.exec_()
+        token_dialog.setInputMode(qt.QInputDialog.TextInput)
+        token_dialog.resize(500, 300)
+        ok = token_dialog.exec_()
+        token = token_dialog.textValue().strip()
 
-        # verify it worked
-        r = subprocess.run([rclone, "listremotes"],
-                           capture_output=True, text=True, timeout=10)
-        if "ucl_drive:" in r.stdout:
+        if not ok or not token:
             self._set_status(self._setup_st,
-                             "✓ Google Drive configured — Drive sync buttons now active",
-                             "#0F6E56")
-        else:
-            # try creating the remote config directly
-            config_script = f"""
-{rclone} config create ucl_drive drive --non-interactive 2>&1 || true
+                             "Setup cancelled — click the button again when ready", "#888")
+            return
+
+        # Create the remote with the pasted token
+        create_script = f"""
+{rclone} config create ucl_drive drive token '{token}' scope drive
 """
-            subprocess.run(["bash", "-c", config_script], timeout=10)
+        r = subprocess.run(["bash", "-c", create_script],
+                           capture_output=True, text=True, timeout=15)
+
+        # Verify
+        r2 = subprocess.run([rclone, "listremotes"], capture_output=True, text=True, timeout=10)
+        if "ucl_drive:" in r2.stdout:
             self._set_status(self._setup_st,
-                             "Please try clicking Set Up Google Drive Sync again "
-                             "and complete the browser authorization", "#888")
+                             "✓ Google Drive configured — sync buttons now active", "#0F6E56")
+        else:
+            self._set_status(self._setup_st,
+                             "✗ Config failed — make sure you pasted the full token JSON. "
+                             "Try again or ask the lead researcher.", "#A32D2D")
 
     def _on_push_drive(self):
         rclone = self._rclone_available()
