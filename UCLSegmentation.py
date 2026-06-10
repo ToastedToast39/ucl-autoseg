@@ -377,7 +377,7 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
 
     def _run_bg(self, cmd, on_done, on_line=None):
         """Run cmd in a background thread; poll for completion on the main thread."""
-        result = {"rc": None, "out": None, "lines": []}
+        result = {"rc": None, "out": None}
 
         def worker():
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -385,6 +385,8 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
             lines = []
             for line in proc.stdout:
                 lines.append(line.rstrip())
+                if on_line:
+                    on_line(line.rstrip())
             proc.wait()
             result["rc"]  = proc.returncode
             result["out"] = "\n".join(lines)
@@ -392,18 +394,21 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
-        # Poll from the main thread every 200ms — safe for Qt UI updates
+        # Store timer on self to prevent garbage collection
+        if not hasattr(self, "_bg_timers"):
+            self._bg_timers = []
         timer = qt.QTimer()
         timer.setInterval(200)
+        self._bg_timers.append(timer)
+
         def poll():
-            if on_line and result["lines"]:
-                for l in result["lines"]:
-                    on_line(l)
-                result["lines"].clear()
-            if not thread.is_alive():
+            if not thread.is_alive() and result["rc"] is not None:
                 timer.stop()
-                if result["rc"] is not None:
-                    on_done(result["rc"], result["out"] or "")
+                try:
+                    self._bg_timers.remove(timer)
+                except ValueError:
+                    pass
+                on_done(result["rc"], result["out"] or "")
         timer.timeout.connect(poll)
         timer.start()
 
