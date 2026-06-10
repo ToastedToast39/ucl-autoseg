@@ -389,7 +389,8 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
             proc.wait()
             rc, out = proc.returncode, "\n".join(lines)
             # on_done updates UI — must run on main thread
-            qt.QTimer.singleShot(0, lambda: on_done(rc, out))
+            # 100ms delay ensures the event loop is running before the callback fires
+            qt.QTimer.singleShot(100, lambda: on_done(rc, out))
         threading.Thread(target=worker, daemon=True).start()
 
     def _py(self): return _PYTHON
