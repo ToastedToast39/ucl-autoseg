@@ -1,0 +1,16 @@
+{
+  "versions": [
+    {
+      "name": "v7_20260610",
+      "date": "2026-06-10",
+      "val_dice": 0.7476,
+      "images": 20,
+      "resize": [320, 512],
+      "epochs": 400,
+      "classes": ["background", "humerus", "ulna"],
+      "file": "ucl_seg_v7_20260610.pt",
+      "notes": "Full 20 image training set, 4 subjects"
+    }
+  ],
+  "active": "v7_20260610"
+}
