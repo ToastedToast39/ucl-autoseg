@@ -377,16 +377,18 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
 
     def _run_bg(self, cmd, on_done, on_line=None):
         """Run cmd in a background thread; poll for completion on the main thread."""
-        result = {"rc": None, "out": None}
+        result  = {"rc": None, "out": None}
+        pending = []          # lines queued by worker, flushed by poll on main thread
 
         def worker():
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, cwd=str(PIPELINE) if PIPELINE.exists() else str(Path.home()))
             lines = []
             for line in proc.stdout:
-                lines.append(line.rstrip())
+                stripped = line.rstrip()
+                lines.append(stripped)
                 if on_line:
-                    on_line(line.rstrip())
+                    pending.append(stripped)   # safe: list.append is atomic in CPython
             proc.wait()
             result["rc"]  = proc.returncode
             result["out"] = "\n".join(lines)
@@ -402,6 +404,10 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._bg_timers.append(timer)
 
         def poll():
+            # flush pending lines on the main thread — safe for Qt UI calls
+            if on_line:
+                while pending:
+                    on_line(pending.pop(0))
             if not thread.is_alive() and result["rc"] is not None:
                 timer.stop()
                 try:
