@@ -376,22 +376,36 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         bar.setVisible(visible); bar.setValue(int(val)); slicer.app.processEvents()
 
     def _run_bg(self, cmd, on_done, on_line=None):
+        """Run cmd in a background thread; poll for completion on the main thread."""
+        result = {"rc": None, "out": None, "lines": []}
+
         def worker():
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, cwd=str(PIPELINE) if PIPELINE.exists() else str(Path.home()))
             lines = []
             for line in proc.stdout:
                 lines.append(line.rstrip())
-                if on_line:
-                    # on_line updates UI — must run on main thread
-                    captured = line.rstrip()
-                    qt.QTimer.singleShot(0, lambda l=captured: on_line(l))
             proc.wait()
-            rc, out = proc.returncode, "\n".join(lines)
-            # on_done updates UI — must run on main thread
-            # 100ms delay ensures the event loop is running before the callback fires
-            qt.QTimer.singleShot(100, lambda: on_done(rc, out))
-        threading.Thread(target=worker, daemon=True).start()
+            result["rc"]  = proc.returncode
+            result["out"] = "\n".join(lines)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        # Poll from the main thread every 200ms — safe for Qt UI updates
+        timer = qt.QTimer()
+        timer.setInterval(200)
+        def poll():
+            if on_line and result["lines"]:
+                for l in result["lines"]:
+                    on_line(l)
+                result["lines"].clear()
+            if not thread.is_alive():
+                timer.stop()
+                if result["rc"] is not None:
+                    on_done(result["rc"], result["out"] or "")
+        timer.timeout.connect(poll)
+        timer.start()
 
     def _py(self): return _PYTHON
 
