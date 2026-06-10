@@ -1371,7 +1371,7 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
         self._set_status(self._drive_st, "Pushing labels to Drive…", "#888")
         local = str(PIPELINE / "subjects")
         cmd = [rclone, "sync", local, self.DRIVE_LABELS,
-               "--include", "*.nii.gz", "--progress"]
+               "--include", "*.nii.gz", "--stats", "0"]
         def done(rc, out):
             if rc == 0:
                 self._set_pb(self._drive_pb, 100)
@@ -1391,7 +1391,7 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
         self._set_status(self._drive_st, "Pulling labels from Drive…", "#888")
         local = str(PIPELINE / "subjects")
         cmd = [rclone, "sync", self.DRIVE_LABELS, local,
-               "--include", "*.nii.gz", "--progress"]
+               "--include", "*.nii.gz", "--stats", "0"]
         def done(rc, out):
             if rc == 0:
                 self._set_pb(self._drive_pb, 100)
