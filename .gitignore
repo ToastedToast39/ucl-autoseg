@@ -1,4 +1,12 @@
-subjects/
+# Ignore binary data — these live on Google Drive
+subjects/*/sessions/*/images/
+subjects/*/sessions/*/masks/
+subjects/*/sessions/*/results/
+subjects/*/sessions/*/overlays/
+
+# Keep subject.json and session folder structure (tracked)
+# so collaborators get the folder scaffolding on git pull
+
 _train_seg/
 _train_lm/
 models/*.pt
