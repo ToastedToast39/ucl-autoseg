@@ -382,8 +382,14 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
             lines = []
             for line in proc.stdout:
                 lines.append(line.rstrip())
-                if on_line: on_line(line.rstrip())
-            proc.wait(); on_done(proc.returncode, "\n".join(lines))
+                if on_line:
+                    # on_line updates UI — must run on main thread
+                    captured = line.rstrip()
+                    qt.QTimer.singleShot(0, lambda l=captured: on_line(l))
+            proc.wait()
+            rc, out = proc.returncode, "\n".join(lines)
+            # on_done updates UI — must run on main thread
+            qt.QTimer.singleShot(0, lambda: on_done(rc, out))
         threading.Thread(target=worker, daemon=True).start()
 
     def _py(self): return _PYTHON
