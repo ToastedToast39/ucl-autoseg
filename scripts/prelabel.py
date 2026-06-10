@@ -146,29 +146,46 @@ def main():
     if not _CV2: raise SystemExit("opencv-python required")
     ap = argparse.ArgumentParser()
     ap.add_argument("--seg_model",  required=True)
-    ap.add_argument("--lm_model",   required=True)
+    ap.add_argument("--lm_model",   default=None)
     ap.add_argument("--images",     required=True)
     ap.add_argument("--max_points", type=int, default=40)
     ap.add_argument("--overwrite",  action="store_true")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    seg_model, seg_resize, nc   = load_seg(args.seg_model, device)
-    lm_model,  lm_resize, names = load_lm(args.lm_model,  device)
-    print(f"device: {device}  seg_classes: {nc}  landmarks: {names}")
+    seg_model, seg_resize, nc = load_seg(args.seg_model, device)
+
+    # Only load landmark model if explicitly provided and different from seg model
+    lm_model = lm_resize = names = None
+    if args.lm_model and args.lm_model != args.seg_model:
+        try:
+            lm_model, lm_resize, names = load_lm(args.lm_model, device)
+        except Exception as e:
+            print(f"Warning: could not load landmark model ({e}) — skipping landmarks")
+            lm_model = lm_resize = names = None
+
+    print(f"device: {device}  seg_classes: {nc}  landmarks: {names if names else 'none'}")
 
     img_dir = Path(args.images)
-    files   = sorted(list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpg")))
+    files   = sorted(list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.dcm")))
     if not files: raise SystemExit(f"No images in {img_dir}")
 
     made = skipped = 0
     for fp in files:
         if fp.with_suffix(".json").exists() and not args.overwrite:
             skipped += 1; continue
-        gray = np.asarray(Image.open(fp).convert("L"))
+        if fp.suffix.lower() == ".dcm":
+            import pydicom
+            ds = pydicom.dcmread(str(fp))
+            arr = ds.pixel_array
+            if arr.ndim == 3:
+                arr = arr.mean(axis=2).astype(np.uint8)
+            gray = arr.astype(np.uint8)
+        else:
+            gray = np.asarray(Image.open(fp).convert("L"))
         H, W = gray.shape
         labels    = predict_seg(seg_model, gray, device, seg_resize)
-        landmarks = predict_lm(lm_model, gray, device, lm_resize, names)
+        landmarks = predict_lm(lm_model, gray, device, lm_resize, names) if lm_model else {}
         polygon_shapes = [(ID_TO_LABEL[cid],
                            mask_to_polygon(labels==cid, args.max_points))
                           for cid in sorted(ID_TO_LABEL)]
