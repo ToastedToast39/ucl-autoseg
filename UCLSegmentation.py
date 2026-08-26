@@ -175,6 +175,11 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
                       "Jumps to the next ~ image (model proposal awaiting correction) and loads it")
         btnNext.clicked.connect(self._on_load_next_unreviewed); fl3.addRow(btnNext)
 
+        btnSaveNext = btn("Save + Next Unreviewed  ⏎", "#6C3483",
+                          "Saves the current corrections, loads the next ~ image, and opens "
+                          "Segment Editor — also on Cmd+Shift+D from anywhere in Slicer")
+        btnSaveNext.clicked.connect(self._on_save_and_next); fl3.addRow(btnSaveNext)
+
         btnSeg = btn("Open Segment Editor", "#2874A6", "Opens Slicer Segment Editor to draw humerus/ulna etc.")
         btnSeg.clicked.connect(self._on_open_seg_editor); fl3.addRow(btnSeg)
 
@@ -318,7 +323,13 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         # ⑨ PRE-LABEL
         cb6, fl6 = section("⑩ Pre-Label New Images", "#2B5FA5", collapsed=True)
         self._prelabel_pb = pb()
-        btnPre = btn("Run Pre-Labeling", "#2B5FA5", "Model draws proposals in Slicer — correct and save"); btnPre.clicked.connect(self._on_prelabel); fl6.addRow(btnPre)
+        btnPre = btn("Run Pre-Labeling (this subject)", "#2B5FA5",
+                     "Refreshes draft proposals for this subject from the ACTIVE model. "
+                     "Verified (✓) images are never touched."); btnPre.clicked.connect(self._on_prelabel); fl6.addRow(btnPre)
+        btnPreAll = btn("Pre-Label ALL Subjects (after retraining)", "#1A5276",
+                        "Regenerates every unverified draft from the ACTIVE model — run this "
+                        "right after training so corrections start from the newest proposals.")
+        btnPreAll.clicked.connect(self._on_prelabel_all); fl6.addRow(btnPreAll)
         fl6.addRow("Progress:", self._prelabel_pb)
         self._prelabel_st = sl(); fl6.addRow("Status:", self._prelabel_st)
 
@@ -372,6 +383,19 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._git_st = sl(); fl8.addRow("GitHub status:", self._git_st)
 
         self.layout.addStretch(1)
+
+        # global Save+Next shortcut — works from Segment Editor so the whole
+        # correction loop is one keystroke. Guard against duplicates on module reload.
+        try:
+            old = getattr(slicer.modules, "_ucl_savenext_shortcut", None)
+            if old is not None:
+                try: old.setParent(None)
+                except Exception: pass
+            sc = qt.QShortcut(qt.QKeySequence("Ctrl+Shift+D"), slicer.util.mainWindow())
+            sc.connect("activated()", self._on_save_and_next)
+            slicer.modules._ucl_savenext_shortcut = sc
+        except Exception as e:
+            print(f"Save+Next shortcut unavailable: {e}")
 
     # =========================================================================
     # Helpers
@@ -483,8 +507,11 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
                       if self._img_combo.itemText(i).startswith("~"))
         n_none  = self._img_combo.count - n_final - n_draft
         try:
+            gv = len(list((PIPELINE/"subjects").glob("*/sessions/*/masks/*.nii.gz")))
+            gd = len(list((PIPELINE/"subjects").glob("*/sessions/*/masks_draft/*.nii.gz")))
             self._img_progress.setText(
-                f"✓ {n_final} verified   ~ {n_draft} to review   {n_none} unlabeled")
+                f"✓ {n_final} verified   ~ {n_draft} to review   {n_none} unlabeled"
+                f"      |   all subjects: ✓ {gv}   ~ {gd}")
         except Exception:
             pass
 
@@ -729,20 +756,31 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._seg_node.CreateDefaultDisplayNodes()
         self._seg_node.GetDisplayNode().SetVisibility(True)
 
-    def _on_load_next_unreviewed(self):
+    def _on_load_next_unreviewed(self, open_editor=False):
         """Jump to the next ~ image (draft awaiting correction) and load it."""
         count = self._img_combo.count
         if count == 0:
-            self._set_status(self._label_st,"No images — select subject/session and Refresh","#A32D2D"); return
+            self._set_status(self._label_st,"No images — select subject/session and Refresh","#A32D2D"); return False
         start = self._img_combo.currentIndex
         for step in range(1, count + 1):
             i = (start + step) % count
             if self._img_combo.itemText(i).startswith("~"):
                 self._img_combo.setCurrentIndex(i)
                 self._on_load_for_labeling()
-                return
+                if open_editor:
+                    try: self._on_open_seg_editor()
+                    except Exception: pass
+                return True
         self._set_status(self._label_st,
                          "✓ No unreviewed images left in this session — all done!","#0F6E56")
+        return False
+
+    def _on_save_and_next(self):
+        """One-keystroke correction loop: save current corrections, load the
+        next unreviewed image, and switch to Segment Editor."""
+        if self._seg_node is not None and self._current_img_stem:
+            self._on_save_labels()
+        self._on_load_next_unreviewed(open_editor=True)
 
     def _on_open_seg_editor(self):
         """Switch to Segment Editor module."""
@@ -1155,7 +1193,27 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
         lm=PIPELINE/"models"/"ucl_landmarks.pt"
         self._run_bg([self._py(),str(PIPELINE/"scripts"/"prelabel.py"),
                       "--seg_model",str(sm),"--lm_model",str(lm) if lm.exists() else str(sm),
-                      "--images",str(img_dir)],done,on_line)
+                      "--images",str(img_dir),"--overwrite"],done,on_line)
+
+    def _on_prelabel_all(self):
+        """Regenerate every unverified draft across all subjects from the active model."""
+        sm = PIPELINE/"models"/"ucl_seg.pt"
+        if not sm.exists(): self._set_status(self._prelabel_st,"No model — train first","#A32D2D"); return
+        total = max(len(list((PIPELINE/"subjects").glob("*/sessions/*/images/*"))),1)
+        dc=[0]
+        self._set_pb(self._prelabel_pb,2); self._set_status(self._prelabel_st,"Pre-labeling all subjects…","#888")
+        def on_line(line):
+            dc[0]+=1; self._set_pb(self._prelabel_pb,min(95,2+int(dc[0]/total*93)))
+        def done(rc,out):
+            if rc==0:
+                self._set_pb(self._prelabel_pb,100)
+                self._set_status(self._prelabel_st,"✓ All drafts refreshed — correct via Panel ⑤","#0F6E56")
+                self._refresh_images()
+            else: self._set_pb(self._prelabel_pb,0,False); self._set_status(self._prelabel_st,"✗ Error — see console","#A32D2D"); print(out)
+        lm=PIPELINE/"models"/"ucl_landmarks.pt"
+        self._run_bg([self._py(),str(PIPELINE/"scripts"/"prelabel.py"),
+                      "--seg_model",str(sm),"--lm_model",str(lm) if lm.exists() else str(sm),
+                      "--all","--overwrite"],done,on_line)
 
     def _on_infer(self):
         if not self._current_subject or self._current_subject.startswith("("):

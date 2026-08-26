@@ -174,10 +174,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seg_model",  required=True)
     ap.add_argument("--lm_model",   default=None)
-    ap.add_argument("--images",     required=True)
+    ap.add_argument("--images",     default=None)
+    ap.add_argument("--all",        action="store_true",
+                    help="pre-label every subjects/*/sessions/*/images/ folder")
     ap.add_argument("--max_points", type=int, default=40)
     ap.add_argument("--overwrite",  action="store_true")
     args = ap.parse_args()
+    if not args.all and not args.images:
+        ap.error("provide --images DIR or --all")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     seg_model, seg_resize, nc = load_seg(args.seg_model, device)
@@ -193,15 +197,23 @@ def main():
 
     print(f"device: {device}  seg_classes: {nc}  landmarks: {names if names else 'none'}")
 
-    img_dir   = Path(args.images)
-    draft_dir = img_dir.parent / "masks_draft"
-    draft_dir.mkdir(parents=True, exist_ok=True)
-    final_dir = img_dir.parent / "masks"
-    files   = sorted(list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.dcm")))
-    if not files: raise SystemExit(f"No images in {img_dir}")
+    if args.all:
+        root = Path(__file__).resolve().parents[1] / "subjects"
+        img_dirs = sorted(d for d in root.glob("*/sessions/*/images") if d.is_dir())
+    else:
+        img_dirs = [Path(args.images)]
+
+    files = []
+    for img_dir in img_dirs:
+        draft_dir = img_dir.parent / "masks_draft"
+        draft_dir.mkdir(parents=True, exist_ok=True)
+        final_dir = img_dir.parent / "masks"
+        for fp in sorted(list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.dcm"))):
+            files.append((fp, draft_dir, final_dir))
+    if not files: raise SystemExit(f"No images found")
 
     made = skipped = errored = 0
-    for fp in files:
+    for fp, draft_dir, final_dir in files:
         nii_out = draft_dir / (fp.stem + ".nii.gz")
         # already human-verified — never overwrite a confirmed label with a fresh draft
         if (final_dir / (fp.stem + ".nii.gz")).exists():
@@ -231,12 +243,13 @@ def main():
             point_shapes   = [(nm, pt) for nm, pt in landmarks.items()]
             write_labelme_json(fp, H, W, polygon_shapes, point_shapes)
             made += 1
+            print(f"  ok {fp.name}", flush=True)   # one line per image → drives the Slicer progress bar
         except Exception as e:
-            print(f"  SKIPPED {fp.name}: {e}")
+            print(f"  SKIPPED {fp.name}: {e}", flush=True)
             errored += 1
 
     print(f"\nPre-labeled {made} images ({skipped} skipped, {errored} errored).")
-    print(f"Draft masks written to '{draft_dir}' — open images in Slicer (Panel ⑤) to review and correct.")
+    print("Drafts written to masks_draft/ — open images in Slicer (Panel ⑤) to review and correct.")
 
 
 if __name__ == "__main__":
