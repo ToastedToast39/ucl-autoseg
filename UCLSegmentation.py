@@ -677,27 +677,47 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
                        if n not in ("ucl_humeral","ucl_ulnar")]
 
         seg = self._seg_node.GetSegmentation()
-        for name, cid in sorted(classes, key=lambda x: x[1]):
-            seg_id = seg.AddEmptySegment(name, name)
-            col = LABEL_COLOURS.get(name, ((0.8,0.8,0.2),""))[0]
-            seg.GetSegment(seg_id).SetColor(*col)
+        id_to_name = {cid: n for n, cid in classes}
 
-        # check if verified labels exist; else fall back to an unreviewed model draft
+        # import verified labels if they exist, else an unreviewed model draft.
+        # Import FIRST, then rename the imported segments by label value —
+        # pre-creating empty named segments would leave the mask content in
+        # separate auto-named duplicates the user can't identify.
         draft_dir = self._current_draft_mask_dir()
         nii_path   = mask_dir / (img_path.stem + ".nii.gz")
         draft_path = draft_dir / (img_path.stem + ".nii.gz") if draft_dir else None
-        if nii_path.exists():
-            existing = slicer.util.loadLabelVolume(str(nii_path))
+        load_path, kind = (nii_path, "verified") if nii_path.exists() else \
+                          (draft_path, "draft") if (draft_path and draft_path.exists()) else \
+                          (None, None)
+        if load_path:
+            existing = slicer.util.loadLabelVolume(str(load_path))
             slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
                 existing, self._seg_node)
             slicer.mrmlScene.RemoveNode(existing)
+            for i in range(seg.GetNumberOfSegments()):
+                s = seg.GetNthSegment(i)
+                try: lv = s.GetLabelValue()
+                except Exception: lv = i + 1
+                if lv in id_to_name:
+                    name = id_to_name[lv]
+                    s.SetName(name)
+                    s.SetColor(*LABEL_COLOURS.get(name, ((0.8,0.8,0.2),""))[0])
+
+        # add empty segments for any class the mask didn't contain
+        # (e.g. model missed the ulna entirely — user needs a segment to draw into)
+        present = {seg.GetNthSegment(i).GetName() for i in range(seg.GetNumberOfSegments())}
+        for name, cid in sorted(classes, key=lambda x: x[1]):
+            if cid == 0 or name in present: continue
+            seg_id = seg.AddEmptySegment(name, name)
+            s = seg.GetSegment(seg_id)
+            s.SetColor(*LABEL_COLOURS.get(name, ((0.8,0.8,0.2),""))[0])
+            try: s.SetLabelValue(cid)
+            except Exception: pass
+
+        if kind == "verified":
             self._set_status(self._label_st,
                              f"✓ Loaded {img_name} with verified labels — edit and save","#0F6E56")
-        elif draft_path and draft_path.exists():
-            existing = slicer.util.loadLabelVolume(str(draft_path))
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-                existing, self._seg_node)
-            slicer.mrmlScene.RemoveNode(existing)
+        elif kind == "draft":
             self._set_status(self._label_st,
                              f"~ Loaded {img_name} with MODEL PROPOSAL (unreviewed) — "
                              f"correct it then click Save Labels to confirm","#B36B00")
