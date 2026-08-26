@@ -961,6 +961,8 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         pf.write_text(json.dumps(data, indent=2))
         self._set_status(self._label_st, msg, col)
         self._refresh_images()
+        if key in data:  # just excluded → keep the correction loop moving
+            self._on_load_next_unreviewed(open_editor=True)
 
     def _record_provenance(self, stem, was_draft):
         """Track how each verified mask was made: corrected pre-label vs manual.
