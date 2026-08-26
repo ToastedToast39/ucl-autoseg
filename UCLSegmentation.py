@@ -699,10 +699,19 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         else:
             vol = slicer.util.loadVolume(str(img_path))
 
+        # maximize the Red view — these are 2D ultrasound images, the other
+        # views are useless, and clicking maximize per image gets old fast
+        try:
+            slicer.app.layoutManager().setLayout(
+                slicer.vtkMRMLLayoutNode.SlicerLayoutOneUpRedSliceView)
+        except Exception:
+            pass
+
         # set as background in all views
         for view in ("Red","Green","Yellow"):
-            lm = slicer.app.layoutManager().sliceWidget(view).sliceLogic()
-            lm.GetSliceCompositeNode().SetBackgroundVolumeID(vol.GetID())
+            w = slicer.app.layoutManager().sliceWidget(view)
+            if w is None: continue
+            w.sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(vol.GetID())
         slicer.util.resetSliceViews()
 
         # create segmentation node with pre-named segments
