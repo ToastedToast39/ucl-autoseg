@@ -653,6 +653,32 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
 
     # ---- LABEL IN SLICER ----
 
+    def _apply_dicom_wl(self, vol, img_path):
+        """Set window/level from image content so ultrasound doesn't display
+        washed out. Luminance-based percentiles: the big black background and
+        burned-in white text are excluded, and RGB channels are averaged first
+        (per-channel percentiles flatten the L15-machine images badly)."""
+        try:
+            import pydicom
+            ds  = pydicom.dcmread(str(img_path), force=True)
+            arr = ds.pixel_array
+            while arr.ndim > 3:
+                arr = arr[0] if arr.shape[0]==1 else arr.reshape(arr.shape[-3],arr.shape[-2],arr.shape[-1])
+            if arr.ndim == 3:
+                arr = arr.mean(axis=2)
+            flat = arr.flatten().astype(float)
+            flat = flat[flat > 5]
+            if len(flat) == 0: return
+            lo = float(np.percentile(flat, 2))
+            hi = float(np.percentile(flat, 98))
+            if hi <= lo + 1: return
+            dn = vol.GetDisplayNode()
+            if dn:
+                dn.SetAutoWindowLevel(0)
+                dn.SetWindowLevelMinMax(lo, hi)
+        except Exception:
+            pass
+
     def _on_load_for_labeling(self):
         """Load selected image into Slicer viewer ready for segmentation."""
         img_name = self._img_combo.currentData
@@ -675,27 +701,10 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
             try:
                 vol = slicer.util.loadVolume(str(img_path),
                       properties={"singleFile": True})
-                # set window/level from actual pixel range
-                try:
-                    import pydicom
-                    ds  = pydicom.dcmread(str(img_path), force=True)
-                    arr = ds.pixel_array
-                    while arr.ndim > 3:
-                        arr = arr[0] if arr.shape[0]==1 else arr.reshape(arr.shape[-3],arr.shape[-2],arr.shape[-1])
-                    flat = arr.flatten().astype(float)
-                    flat = flat[flat > 5]
-                    if len(flat) > 0:
-                        lo = float(np.percentile(flat, 2))
-                        hi = float(np.percentile(flat, 98))
-                        dn = vol.GetDisplayNode()
-                        if dn:
-                            dn.SetAutoWindowLevel(0)
-                            dn.SetWindowLevelMinMax(lo, hi)
-                except Exception:
-                    pass
             except Exception as e:
                 print(f"Load error: {e}")
                 vol = slicer.util.loadVolume(str(img_path))
+            self._apply_dicom_wl(vol, img_path)
         else:
             vol = slicer.util.loadVolume(str(img_path))
 
