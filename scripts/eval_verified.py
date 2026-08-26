@@ -103,6 +103,11 @@ def main():
     hf = PIPELINE / "holdout_subjects.json"
     if hf.exists():
         holdout = set(json.loads(hf.read_text()).get("holdout_subjects", []))
+    excluded = set()
+    ef = PIPELINE / "excluded_images.json"
+    if ef.exists():
+        try: excluded = set(json.loads(ef.read_text()).keys())
+        except Exception: pass
 
     out_dir = Path(args.overlays) if args.overlays else None
     if out_dir: out_dir.mkdir(parents=True, exist_ok=True)
@@ -116,6 +121,7 @@ def main():
             if not mask_dir.exists(): continue
             for mp in sorted(mask_dir.glob("*.nii.gz")):
                 stem = mp.name.replace(".nii.gz", "")
+                if f"{subj.name}/{sess.name}/{stem}" in excluded: continue
                 fp = next((img_dir / (stem + e) for e in (".dcm", ".png", ".jpg")
                            if (img_dir / (stem + e)).exists()), None)
                 if fp is None: continue

@@ -16,13 +16,20 @@ from pathlib import Path
 PIPELINE = Path(__file__).resolve().parents[1]
 OUT_IMGS  = PIPELINE / "_train_seg" / "images"
 OUT_MASKS = PIPELINE / "_train_seg" / "masks"
-HOLDOUT_FILE = PIPELINE / "holdout_subjects.json"
+HOLDOUT_FILE  = PIPELINE / "holdout_subjects.json"
+EXCLUDED_FILE = PIPELINE / "excluded_images.json"
 
 
 def load_holdout():
     """Subjects reserved for clinical validation — never included in training data."""
     if not HOLDOUT_FILE.exists(): return set()
     return set(json.loads(HOLDOUT_FILE.read_text()).get("holdout_subjects", []))
+
+
+def load_excluded():
+    """Images marked as wrong anatomy (e.g. supraspinatus) — never trained on."""
+    if not EXCLUDED_FILE.exists(): return set()
+    return set(json.loads(EXCLUDED_FILE.read_text()).keys())
 
 
 def main():
@@ -33,9 +40,11 @@ def main():
     for f in OUT_IMGS.glob("*"):  f.unlink()
     for f in OUT_MASKS.glob("*"): f.unlink()
 
-    holdout = load_holdout()
+    holdout  = load_holdout()
+    excluded = load_excluded()
     total = 0
     skipped_holdout = 0
+    skipped_excluded = 0
     subjects_dir = PIPELINE / "subjects"
     if not subjects_dir.exists():
         print("No subjects found."); return
@@ -54,6 +63,8 @@ def main():
                                    list(img_dir.glob("*.png")) +
                                    list(img_dir.glob("*.jpg"))):
                 stem = img_path.stem
+                if f"{subj.name}/{sess.name}/{stem}" in excluded:
+                    skipped_excluded += 1; continue
                 tag  = f"{subj.name}__{sess.name}__{stem}"
 
                 # find mask — NIfTI first, PNG fallback
@@ -72,6 +83,8 @@ def main():
     print(f"Training set built: {total} labeled images → {PIPELINE/'_train_seg'}/")
     if holdout:
         print(f"Holdout subjects excluded: {sorted(holdout)} ({skipped_holdout} skipped)")
+    if skipped_excluded:
+        print(f"Wrong-anatomy images excluded: {skipped_excluded}")
     return total
 
 

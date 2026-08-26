@@ -203,6 +203,12 @@ def main():
     else:
         img_dirs = [Path(args.images)]
 
+    excluded = set()
+    excl_file = Path(__file__).resolve().parents[1] / "excluded_images.json"
+    if excl_file.exists():
+        try: excluded = set(json.loads(excl_file.read_text()).keys())
+        except Exception: pass
+
     files = []
     for img_dir in img_dirs:
         draft_dir = img_dir.parent / "masks_draft"
@@ -215,6 +221,10 @@ def main():
     made = skipped = errored = 0
     for fp, draft_dir, final_dir in files:
         nii_out = draft_dir / (fp.stem + ".nii.gz")
+        # subjects/<S>/sessions/<sess>/images/<file> → S/sess/stem
+        if f"{fp.parents[3].name}/{fp.parents[1].name}/{fp.stem}" in excluded:
+            print(f"  skip {fp.name} (excluded — wrong anatomy)", flush=True)
+            skipped += 1; continue
         # already human-verified — never overwrite a confirmed label with a fresh draft
         if (final_dir / (fp.stem + ".nii.gz")).exists():
             print(f"  skip {fp.name} (verified)", flush=True)   # keeps progress bar honest

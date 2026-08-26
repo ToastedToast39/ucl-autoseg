@@ -185,6 +185,11 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
                           "Segment Editor — also on Cmd+Shift+D from anywhere in Slicer")
         btnSaveNext.clicked.connect(self._on_save_and_next); fl3.addRow(btnSaveNext)
 
+        btnExclude = btn("Exclude Image (wrong anatomy)  ⊘", "#8B0000",
+                         "Marks the selected image as NOT UCL anatomy (e.g. supraspinatus) — "
+                         "skipped by pre-labeling, training, and Save+Next. Click again to un-exclude.")
+        btnExclude.clicked.connect(self._on_toggle_exclude); fl3.addRow(btnExclude)
+
         btnSeg = btn("Open Segment Editor", "#2874A6", "Opens Slicer Segment Editor to draw humerus/ulna etc.")
         btnSeg.clicked.connect(self._on_open_seg_editor); fl3.addRow(btnSeg)
 
@@ -500,21 +505,26 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
                  sorted(img_dir.glob("*.jpg")))
         mask_dir  = PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"masks"
         draft_dir = PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"masks_draft"
+        excluded  = self._load_exclusions()
         for f in files:
+            key = f"{self._current_subject}/{self._current_session}/{f.stem}"
             has_final = mask_dir.exists() and (
                 (mask_dir/(f.stem+".nii.gz")).exists() or
                 (mask_dir/(f.stem+".png")).exists()
             )
             has_draft = draft_dir.exists() and (draft_dir/(f.stem+".nii.gz")).exists()
-            if has_final:   label = f"✓ {f.name}"   # human-verified
-            elif has_draft: label = f"~ {f.name}"   # model proposal, unreviewed
-            else:           label = f.name
+            if key in excluded: label = f"⊘ {f.name}"  # wrong anatomy — out of the loop
+            elif has_final:     label = f"✓ {f.name}"  # human-verified
+            elif has_draft:     label = f"~ {f.name}"  # model proposal, unreviewed
+            else:               label = f.name
             self._img_combo.addItem(label, f.name)
         n_final = sum(1 for i in range(self._img_combo.count)
                       if self._img_combo.itemText(i).startswith("✓"))
         n_draft = sum(1 for i in range(self._img_combo.count)
                       if self._img_combo.itemText(i).startswith("~"))
-        n_none  = self._img_combo.count - n_final - n_draft
+        n_excl  = sum(1 for i in range(self._img_combo.count)
+                      if self._img_combo.itemText(i).startswith("⊘"))
+        n_none  = self._img_combo.count - n_final - n_draft - n_excl
         try:
             gv = len(list((PIPELINE/"subjects").glob("*/sessions/*/masks/*.nii.gz")))
             gd = len(list((PIPELINE/"subjects").glob("*/sessions/*/masks_draft/*.nii.gz")))
@@ -524,7 +534,7 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
                 corrected = sum(1 for v in json.loads(pf.read_text()).values()
                                 if v.get("source") == "corrected_prelabel")
             self._img_progress.setText(
-                f"✓ {n_final} verified   ~ {n_draft} to review   {n_none} unlabeled"
+                f"✓ {n_final} verified   ~ {n_draft} to review   ⊘ {n_excl} excluded   {n_none} unlabeled"
                 f"      |   all subjects: ✓ {gv}   ~ {gd}   corrected pre-labels: {corrected}")
         except Exception:
             pass
@@ -913,6 +923,44 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._new_label_edit.clear()
         self._refresh_labels()
         self._set_status(self._class_st, f"✓ Added '{name}' as class {new_id}. Reload image to use it.", "#0F6E56")
+
+    def _load_exclusions(self):
+        try:
+            pf = PIPELINE / "excluded_images.json"
+            return json.loads(pf.read_text()) if pf.exists() else {}
+        except Exception:
+            return {}
+
+    def _on_toggle_exclude(self):
+        """Mark/unmark the selected image as non-UCL anatomy."""
+        img_name = self._img_combo.currentData
+        if not img_name or not self._current_subject or self._current_subject.startswith("("):
+            self._set_status(self._label_st, "Select an image first", "#A32D2D"); return
+        stem = Path(img_name).stem
+        key  = f"{self._current_subject}/{self._current_session}/{stem}"
+        pf   = PIPELINE / "excluded_images.json"
+        data = self._load_exclusions()
+        if key in data:
+            del data[key]
+            msg, col = f"✓ {img_name} re-included", "#0F6E56"
+        else:
+            import datetime
+            data[key] = {"reason": "non_ucl_anatomy",
+                         "date": datetime.date.today().isoformat()}
+            # remove any draft so it never resurfaces in the correction loop
+            dd = self._current_draft_mask_dir()
+            if dd:
+                dp = dd / (stem + ".nii.gz")
+                if dp.exists():
+                    try: dp.unlink()
+                    except Exception: pass
+            msg, col = f"⊘ {img_name} excluded (wrong anatomy)", "#8B0000"
+            mask_dir = self._current_mask_dir()
+            if mask_dir and (mask_dir / (stem + ".nii.gz")).exists():
+                msg += " — its verified mask is kept on disk but no longer trains"
+        pf.write_text(json.dumps(data, indent=2))
+        self._set_status(self._label_st, msg, col)
+        self._refresh_images()
 
     def _record_provenance(self, stem, was_draft):
         """Track how each verified mask was made: corrected pre-label vs manual.
