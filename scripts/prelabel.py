@@ -32,6 +32,10 @@ try:
     import cv2; _CV2 = True
 except Exception: _CV2 = False
 
+try:
+    import nibabel as nib; _HAS_NIBABEL = True
+except Exception: _HAS_NIBABEL = False
+
 # reverse map: class_id → label name
 ID_TO_LABEL = {v: k for k, v in SEG_CLASS_MAP.items()}
 
@@ -116,6 +120,19 @@ def mask_to_polygon(mask, max_points=40):
     return pts.astype(float)
 
 
+def save_nifti_mask(labels, out_path):
+    """Save label map as NIfTI — same convention as process_ucl_subject.py's
+    save_nifti(), so masks land in the format UCLSegmentation.py's
+    'Label in Slicer' panel already knows how to load."""
+    if not _HAS_NIBABEL:
+        print("  (nibabel not installed — skipping .nii.gz mask output)")
+        return False
+    data = labels.astype(np.int16)[..., np.newaxis]
+    img  = nib.Nifti1Image(data, affine=np.eye(4))
+    nib.save(img, str(out_path))
+    return True
+
+
 def write_labelme_json(img_path, H, W, polygon_shapes, point_shapes):
     """Extended version of write_labelme_json from prelabel.py.
     polygon_shapes: [(label, pts_array)]
@@ -166,13 +183,16 @@ def main():
 
     print(f"device: {device}  seg_classes: {nc}  landmarks: {names if names else 'none'}")
 
-    img_dir = Path(args.images)
+    img_dir  = Path(args.images)
+    mask_dir = img_dir.parent / "masks"
+    mask_dir.mkdir(parents=True, exist_ok=True)
     files   = sorted(list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.dcm")))
     if not files: raise SystemExit(f"No images in {img_dir}")
 
     made = skipped = 0
     for fp in files:
-        if fp.with_suffix(".json").exists() and not args.overwrite:
+        nii_out = mask_dir / (fp.stem + ".nii.gz")
+        if nii_out.exists() and not args.overwrite:
             skipped += 1; continue
         if fp.suffix.lower() == ".dcm":
             import pydicom
@@ -186,6 +206,7 @@ def main():
         H, W = gray.shape
         labels    = predict_seg(seg_model, gray, device, seg_resize)
         landmarks = predict_lm(lm_model, gray, device, lm_resize, names) if lm_model else {}
+        save_nifti_mask(labels, nii_out)
         polygon_shapes = [(ID_TO_LABEL[cid],
                            mask_to_polygon(labels==cid, args.max_points))
                           for cid in sorted(ID_TO_LABEL)]
@@ -194,7 +215,7 @@ def main():
         made += 1
 
     print(f"\nPre-labeled {made} images ({skipped} skipped).")
-    print(f"Open '{img_dir}' in Labelme — correct polygons AND landmark points.")
+    print(f"Masks written to '{mask_dir}' — open images in Slicer (Panel ⑤) to review and correct.")
 
 
 if __name__ == "__main__":
