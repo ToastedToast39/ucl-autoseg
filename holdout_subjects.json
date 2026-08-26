@@ -1,0 +1,4 @@
+{
+  "holdout_subjects": ["11192502", "PLUCSD009", "PLUCSD004"],
+  "note": "Clinical validation holdout — these subjects must never enter build_training_set.py output or any training run. Do not pre-label/correct them for training purposes; they exist to be scored against a model that has never seen them. Do not edit this list without re-evaluating what's already been trained on it."
+}

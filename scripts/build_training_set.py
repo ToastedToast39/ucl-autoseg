@@ -10,12 +10,19 @@ Run before training, or called automatically by train_seg.py.
 Usage:
     python scripts/build_training_set.py
 """
-import shutil, sys
+import json, shutil, sys
 from pathlib import Path
 
 PIPELINE = Path(__file__).resolve().parents[1]
 OUT_IMGS  = PIPELINE / "_train_seg" / "images"
 OUT_MASKS = PIPELINE / "_train_seg" / "masks"
+HOLDOUT_FILE = PIPELINE / "holdout_subjects.json"
+
+
+def load_holdout():
+    """Subjects reserved for clinical validation — never included in training data."""
+    if not HOLDOUT_FILE.exists(): return set()
+    return set(json.loads(HOLDOUT_FILE.read_text()).get("holdout_subjects", []))
 
 
 def main():
@@ -26,13 +33,17 @@ def main():
     for f in OUT_IMGS.glob("*"):  f.unlink()
     for f in OUT_MASKS.glob("*"): f.unlink()
 
+    holdout = load_holdout()
     total = 0
+    skipped_holdout = 0
     subjects_dir = PIPELINE / "subjects"
     if not subjects_dir.exists():
         print("No subjects found."); return
 
     for subj in sorted(subjects_dir.iterdir()):
         if not subj.is_dir(): continue
+        if subj.name in holdout:
+            skipped_holdout += 1; continue
         for sess in sorted((subj/"sessions").iterdir() if (subj/"sessions").exists() else []):
             if not sess.is_dir(): continue
             img_dir  = sess / "images"
@@ -59,6 +70,8 @@ def main():
                     total += 1
 
     print(f"Training set built: {total} labeled images → {PIPELINE/'_train_seg'}/")
+    if holdout:
+        print(f"Holdout subjects excluded: {sorted(holdout)} ({skipped_holdout} skipped)")
     return total
 
 
