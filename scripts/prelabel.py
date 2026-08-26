@@ -196,7 +196,7 @@ def main():
     files   = sorted(list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.dcm")))
     if not files: raise SystemExit(f"No images in {img_dir}")
 
-    made = skipped = 0
+    made = skipped = errored = 0
     for fp in files:
         nii_out = draft_dir / (fp.stem + ".nii.gz")
         # already human-verified — never overwrite a confirmed label with a fresh draft
@@ -204,27 +204,34 @@ def main():
             skipped += 1; continue
         if nii_out.exists() and not args.overwrite:
             skipped += 1; continue
-        if fp.suffix.lower() == ".dcm":
-            import pydicom
-            ds = pydicom.dcmread(str(fp))
-            arr = ds.pixel_array
-            if arr.ndim == 3:
-                arr = arr.mean(axis=2).astype(np.uint8)
-            gray = arr.astype(np.uint8)
-        else:
-            gray = np.asarray(Image.open(fp).convert("L"))
-        H, W = gray.shape
-        labels    = predict_seg(seg_model, gray, device, seg_resize)
-        landmarks = predict_lm(lm_model, gray, device, lm_resize, names) if lm_model else {}
-        save_nifti_mask(labels, nii_out)
-        polygon_shapes = [(ID_TO_LABEL[cid],
-                           mask_to_polygon(labels==cid, args.max_points))
-                          for cid in sorted(ID_TO_LABEL)]
-        point_shapes   = [(nm, pt) for nm, pt in landmarks.items()]
-        write_labelme_json(fp, H, W, polygon_shapes, point_shapes)
-        made += 1
+        try:
+            if fp.suffix.lower() == ".dcm":
+                import pydicom
+                ds = pydicom.dcmread(str(fp))
+                arr = ds.pixel_array
+                if arr.ndim == 3:
+                    arr = arr.mean(axis=2).astype(np.uint8)
+                if arr.ndim != 2:
+                    raise ValueError(f"unsupported pixel array shape {arr.shape} "
+                                      f"(likely a multi-frame/cine DICOM, not a still image)")
+                gray = arr.astype(np.uint8)
+            else:
+                gray = np.asarray(Image.open(fp).convert("L"))
+            H, W = gray.shape
+            labels    = predict_seg(seg_model, gray, device, seg_resize)
+            landmarks = predict_lm(lm_model, gray, device, lm_resize, names) if lm_model else {}
+            save_nifti_mask(labels, nii_out)
+            polygon_shapes = [(ID_TO_LABEL[cid],
+                               mask_to_polygon(labels==cid, args.max_points))
+                              for cid in sorted(ID_TO_LABEL)]
+            point_shapes   = [(nm, pt) for nm, pt in landmarks.items()]
+            write_labelme_json(fp, H, W, polygon_shapes, point_shapes)
+            made += 1
+        except Exception as e:
+            print(f"  SKIPPED {fp.name}: {e}")
+            errored += 1
 
-    print(f"\nPre-labeled {made} images ({skipped} skipped).")
+    print(f"\nPre-labeled {made} images ({skipped} skipped, {errored} errored).")
     print(f"Draft masks written to '{draft_dir}' — open images in Slicer (Panel ⑤) to review and correct.")
 
 
