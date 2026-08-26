@@ -148,6 +148,45 @@ def main():
                         "backbone": backbone_tag}, args.out)
             print(f"  saved → {args.out}  (dice {best:.4f})")
     print(f"\ndone. best val dice {best:.4f}")
+    log_run(args, resize, len(tr), len(va), best, backbone_tag)
+
+
+def log_run(args, resize, n_tr, n_val, best, backbone_tag):
+    """Append this run to training_runs.xlsx (sheet 'Training Runs');
+    fall back to training_runs.csv if openpyxl isn't installed."""
+    import datetime, platform
+    root = Path(__file__).resolve().parents[1]
+    n_labels = len(list((root / "subjects").glob("*/sessions/*/masks/*.nii.gz")))
+    row = [Path(args.out).stem, datetime.date.today().isoformat(),
+           platform.node(),
+           "cuda" if torch.cuda.is_available() else "cpu",
+           backbone_tag, args.epochs,
+           f"{resize[0]}x{resize[1]}" if resize else "none",
+           args.batch, args.lr, n_tr, n_val, n_labels,
+           round(best, 4), Path(args.out).name, ""]
+    xlsx = root / "training_runs.xlsx"
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(str(xlsx))
+        ws = wb["Training Runs"]
+        ws.append(row)
+        from openpyxl.styles import Font
+        for c in ws[ws.max_row]: c.font = Font(name="Arial", size=11)
+        wb.save(str(xlsx))
+        print(f"run logged → {xlsx.name}")
+    except Exception as e:
+        import csv
+        csvp = root / "training_runs.csv"
+        new = not csvp.exists()
+        with open(csvp, "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["Version","Date","Machine","Device","Backbone","Epochs",
+                            "Resize","Batch","LR","Train Imgs","Val Imgs",
+                            "Verified Labels","Val Dice","Model File","Notes"])
+            w.writerow(row)
+        print(f"run logged → {csvp.name} (xlsx unavailable: {e}) — "
+              f"paste this row into training_runs.xlsx when convenient")
 
 
 if __name__ == "__main__":
