@@ -154,16 +154,22 @@ def main():
 def log_run(args, resize, n_tr, n_val, best, backbone_tag):
     """Append this run to training_runs.xlsx (sheet 'Training Runs');
     fall back to training_runs.csv if openpyxl isn't installed."""
-    import datetime, platform
+    import datetime, json, platform
     root = Path(__file__).resolve().parents[1]
     n_labels = len(list((root / "subjects").glob("*/sessions/*/masks/*.nii.gz")))
+    note = ""
+    try:
+        prov = json.loads((root / "label_provenance.json").read_text())
+        n_corr = sum(1 for v in prov.values() if v.get("source") == "corrected_prelabel")
+        note = f"{n_labels - n_corr} baseline + {n_corr} corrected pre-labels"
+    except Exception: pass
     row = [Path(args.out).stem, datetime.date.today().isoformat(),
            platform.node(),
            "cuda" if torch.cuda.is_available() else "cpu",
            backbone_tag, args.epochs,
            f"{resize[0]}x{resize[1]}" if resize else "none",
            args.batch, args.lr, n_tr, n_val, n_labels,
-           round(best, 4), Path(args.out).name, ""]
+           round(best, 4), Path(args.out).name, note]
     xlsx = root / "training_runs.xlsx"
     try:
         import openpyxl

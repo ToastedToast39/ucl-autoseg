@@ -509,9 +509,14 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         try:
             gv = len(list((PIPELINE/"subjects").glob("*/sessions/*/masks/*.nii.gz")))
             gd = len(list((PIPELINE/"subjects").glob("*/sessions/*/masks_draft/*.nii.gz")))
+            corrected = 0
+            pf = PIPELINE / "label_provenance.json"
+            if pf.exists():
+                corrected = sum(1 for v in json.loads(pf.read_text()).values()
+                                if v.get("source") == "corrected_prelabel")
             self._img_progress.setText(
                 f"✓ {n_final} verified   ~ {n_draft} to review   {n_none} unlabeled"
-                f"      |   all subjects: ✓ {gv}   ~ {gd}")
+                f"      |   all subjects: ✓ {gv}   ~ {gd}   corrected pre-labels: {corrected}")
         except Exception:
             pass
 
@@ -839,13 +844,18 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
             slicer.util.saveNode(lm_node, str(out_path))
             slicer.mrmlScene.RemoveNode(lm_node)
 
-            # retire the model draft — this image is now human-verified
+            # retire the model draft — this image is now human-verified.
+            # A draft existing at save time means this was a corrected pre-label,
+            # not a from-scratch manual label — record that provenance.
+            was_draft = False
             draft_dir = self._current_draft_mask_dir()
             if draft_dir:
                 dp = draft_dir / (self._current_img_stem + ".nii.gz")
                 if dp.exists():
+                    was_draft = True
                     try: dp.unlink()
                     except Exception: pass
+            self._record_provenance(self._current_img_stem, was_draft)
 
             self._set_status(self._label_st,
                              f"✓ Saved labels → {out_path.name}", "#0F6E56")
@@ -877,6 +887,36 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._refresh_labels()
         self._set_status(self._class_st, f"✓ Added '{name}' as class {new_id}. Reload image to use it.", "#0F6E56")
 
+    def _record_provenance(self, stem, was_draft):
+        """Track how each verified mask was made: corrected pre-label vs manual.
+        Keyed per image so re-saving updates instead of double-counting."""
+        try:
+            import datetime
+            pf = PIPELINE / "label_provenance.json"
+            data = json.loads(pf.read_text()) if pf.exists() else {}
+            key = f"{self._current_subject}/{self._current_session}/{stem}"
+            active = ""
+            try:
+                active = json.loads((PIPELINE/"VERSIONS.json").read_text()).get("active", "")
+            except Exception: pass
+            data[key] = {
+                "source": "corrected_prelabel" if was_draft else "manual",
+                "date":   datetime.date.today().isoformat(),
+                "model":  active if was_draft else "",
+            }
+            pf.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            print(f"provenance record failed: {e}")
+
+    def _remove_provenance(self, stem):
+        try:
+            pf = PIPELINE / "label_provenance.json"
+            if not pf.exists(): return
+            data = json.loads(pf.read_text())
+            data.pop(f"{self._current_subject}/{self._current_session}/{stem}", None)
+            pf.write_text(json.dumps(data, indent=2))
+        except Exception: pass
+
     def _on_delete_labels(self):
         """Delete the saved mask for the currently loaded image."""
         if not self._current_img_stem:
@@ -890,6 +930,7 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
             if p.exists():
                 p.unlink(); deleted = True
         if deleted:
+            self._remove_provenance(self._current_img_stem)
             self._set_status(self._label_st, f"✓ Labels deleted for {self._current_img_stem}", "#0F6E56")
             self._refresh_images()
         else:
