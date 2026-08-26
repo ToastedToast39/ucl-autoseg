@@ -153,7 +153,9 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
 
         info3 = qt.QLabel(
             "Load a DICOM directly, draw segmentations in the Segment Editor, "
-            "then Save Labels. No conversion needed."
+            "then Save Labels. No conversion needed.\n"
+            "In the image list: ✓ = human-verified, ~ = model proposal (unreviewed, "
+            "not yet used for training) — correct it and Save Labels to confirm."
         )
         info3.setWordWrap(True); info3.setStyleSheet("font-size:11px;color:#aaa;padding:4px;")
         fl3.addRow(info3)
@@ -336,7 +338,7 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
 
         self._drive_pb = pb()
         btnPushDrive = btn("Push Labels to Drive", "#0F6E56",
-                           "Uploads all your .nii.gz mask files to Google Drive UCL Autoseg/labels/")
+                           "Uploads your verified masks/ (not masks_draft/ proposals) to Google Drive UCL Autoseg/labels/")
         btnPushDrive.clicked.connect(self._on_push_drive); fl8.addRow(btnPushDrive)
 
         btnPullDrive = btn("Pull Labels from Drive", "#2B5FA5",
@@ -456,13 +458,17 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         files = (sorted(img_dir.glob("*.dcm")) +
                  sorted(img_dir.glob("*.png")) +
                  sorted(img_dir.glob("*.jpg")))
-        mask_dir = PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"masks"
+        mask_dir  = PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"masks"
+        draft_dir = PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"masks_draft"
         for f in files:
-            has_mask = mask_dir.exists() and (
+            has_final = mask_dir.exists() and (
                 (mask_dir/(f.stem+".nii.gz")).exists() or
                 (mask_dir/(f.stem+".png")).exists()
             )
-            label = f"✓ {f.name}" if has_mask else f.name
+            has_draft = draft_dir.exists() and (draft_dir/(f.stem+".nii.gz")).exists()
+            if has_final:   label = f"✓ {f.name}"   # human-verified
+            elif has_draft: label = f"~ {f.name}"   # model proposal, unreviewed
+            else:           label = f.name
             self._img_combo.addItem(label, f.name)
 
     def _refresh_labels(self):
@@ -483,6 +489,13 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
     def _current_mask_dir(self):
         if not self._current_subject or not self._current_session: return None
         d = PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"masks"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _current_draft_mask_dir(self):
+        """Unreviewed model proposals from Pre-Label — never used for training."""
+        if not self._current_subject or not self._current_session: return None
+        d = PIPELINE/"subjects"/self._current_subject/"sessions"/self._current_session/"masks_draft"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -652,15 +665,25 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
             col = LABEL_COLOURS.get(name, ((0.8,0.8,0.2),""))[0]
             seg.GetSegment(seg_id).SetColor(*col)
 
-        # check if labels already exist and load them
-        nii_path = mask_dir / (img_path.stem + ".nii.gz")
+        # check if verified labels exist; else fall back to an unreviewed model draft
+        draft_dir = self._current_draft_mask_dir()
+        nii_path   = mask_dir / (img_path.stem + ".nii.gz")
+        draft_path = draft_dir / (img_path.stem + ".nii.gz") if draft_dir else None
         if nii_path.exists():
             existing = slicer.util.loadLabelVolume(str(nii_path))
             slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
                 existing, self._seg_node)
             slicer.mrmlScene.RemoveNode(existing)
             self._set_status(self._label_st,
-                             f"✓ Loaded {img_name} with existing labels — edit and save","#0F6E56")
+                             f"✓ Loaded {img_name} with verified labels — edit and save","#0F6E56")
+        elif draft_path and draft_path.exists():
+            existing = slicer.util.loadLabelVolume(str(draft_path))
+            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                existing, self._seg_node)
+            slicer.mrmlScene.RemoveNode(existing)
+            self._set_status(self._label_st,
+                             f"~ Loaded {img_name} with MODEL PROPOSAL (unreviewed) — "
+                             f"correct it then click Save Labels to confirm","#B36B00")
         else:
             self._set_status(self._label_st,
                              f"✓ Loaded {img_name} — draw segments then click Save Labels","#0F6E56")
@@ -1397,7 +1420,7 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
         self._set_status(self._drive_st, "Pushing labels to Drive…", "#888")
         local = str(PIPELINE / "subjects")
         cmd = [rclone, "sync", local, self.DRIVE_LABELS,
-               "--include", "*.nii.gz", "--stats", "0"]
+               "--include", "*/sessions/*/masks/*.nii.gz", "--stats", "0"]
         def done(rc, out):
             if rc == 0:
                 self._set_pb(self._drive_pb, 100)
@@ -1417,7 +1440,7 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
         self._set_status(self._drive_st, "Pulling labels from Drive…", "#888")
         local = str(PIPELINE / "subjects")
         cmd = [rclone, "sync", self.DRIVE_LABELS, local,
-               "--include", "*.nii.gz", "--stats", "0"]
+               "--include", "*/sessions/*/masks/*.nii.gz", "--stats", "0"]
         def done(rc, out):
             if rc == 0:
                 self._set_pb(self._drive_pb, 100)

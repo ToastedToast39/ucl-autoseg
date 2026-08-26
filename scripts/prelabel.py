@@ -123,7 +123,13 @@ def mask_to_polygon(mask, max_points=40):
 def save_nifti_mask(labels, out_path):
     """Save label map as NIfTI — same convention as process_ucl_subject.py's
     save_nifti(), so masks land in the format UCLSegmentation.py's
-    'Label in Slicer' panel already knows how to load."""
+    'Label in Slicer' panel already knows how to load.
+
+    Written to masks_draft/, not masks/ — these are unreviewed model
+    proposals, not human-verified ground truth. build_training_set.py
+    only ever reads masks/, so drafts can never leak into training until
+    a human opens them in Segment Editor and clicks Save Labels, which
+    writes the corrected version into masks/."""
     if not _HAS_NIBABEL:
         print("  (nibabel not installed — skipping .nii.gz mask output)")
         return False
@@ -183,15 +189,19 @@ def main():
 
     print(f"device: {device}  seg_classes: {nc}  landmarks: {names if names else 'none'}")
 
-    img_dir  = Path(args.images)
-    mask_dir = img_dir.parent / "masks"
-    mask_dir.mkdir(parents=True, exist_ok=True)
+    img_dir   = Path(args.images)
+    draft_dir = img_dir.parent / "masks_draft"
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    final_dir = img_dir.parent / "masks"
     files   = sorted(list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.dcm")))
     if not files: raise SystemExit(f"No images in {img_dir}")
 
     made = skipped = 0
     for fp in files:
-        nii_out = mask_dir / (fp.stem + ".nii.gz")
+        nii_out = draft_dir / (fp.stem + ".nii.gz")
+        # already human-verified — never overwrite a confirmed label with a fresh draft
+        if (final_dir / (fp.stem + ".nii.gz")).exists():
+            skipped += 1; continue
         if nii_out.exists() and not args.overwrite:
             skipped += 1; continue
         if fp.suffix.lower() == ".dcm":
@@ -215,7 +225,7 @@ def main():
         made += 1
 
     print(f"\nPre-labeled {made} images ({skipped} skipped).")
-    print(f"Masks written to '{mask_dir}' — open images in Slicer (Panel ⑤) to review and correct.")
+    print(f"Draft masks written to '{draft_dir}' — open images in Slicer (Panel ⑤) to review and correct.")
 
 
 if __name__ == "__main__":

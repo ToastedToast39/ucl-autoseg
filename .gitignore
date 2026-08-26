@@ -1,6 +1,7 @@
 # Ignore binary data — these live on Google Drive
 subjects/*/sessions/*/images/
 subjects/*/sessions/*/masks/
+subjects/*/sessions/*/masks_draft/
 subjects/*/sessions/*/results/
 subjects/*/sessions/*/overlays/
 
