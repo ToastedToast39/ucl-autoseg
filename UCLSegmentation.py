@@ -73,9 +73,14 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
 
         def btn(label, color=BLUE, tip=""):
             b = qt.QPushButton(label)
+            # Qt reads hex alpha FIRST (#AARRGGBB); appending CC made 3-digit
+            # colors invalid (#666CC warnings) and 6-digit hovers near-transparent
+            c = color.lstrip("#")
+            if len(c) == 3: c = "".join(ch*2 for ch in c)
+            hover = f"#CC{c}"
             b.setStyleSheet(f"QPushButton{{background-color:{color};color:white;font-weight:bold;"
                             f"padding:7px 14px;border-radius:5px;font-size:12px;}}"
-                            f"QPushButton:hover{{background-color:{color}CC;}}")
+                            f"QPushButton:hover{{background-color:{hover};}}")
             b.setToolTip(tip); return b
 
         def pb(style=BAR):
@@ -414,8 +419,12 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         pending = []          # lines queued by worker, flushed by poll on main thread
 
         def worker():
+            # PYTHONUNBUFFERED so child python streams lines as they happen —
+            # block-buffered pipes made progress bars freeze then jump
+            env = dict(os.environ, PYTHONUNBUFFERED="1")
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, cwd=str(PIPELINE) if PIPELINE.exists() else str(Path.home()))
+                                    text=True, env=env,
+                                    cwd=str(PIPELINE) if PIPELINE.exists() else str(Path.home()))
             lines = []
             for line in proc.stdout:
                 stripped = line.rstrip()

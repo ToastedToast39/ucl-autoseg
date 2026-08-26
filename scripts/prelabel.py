@@ -217,8 +217,10 @@ def main():
         nii_out = draft_dir / (fp.stem + ".nii.gz")
         # already human-verified — never overwrite a confirmed label with a fresh draft
         if (final_dir / (fp.stem + ".nii.gz")).exists():
+            print(f"  skip {fp.name} (verified)", flush=True)   # keeps progress bar honest
             skipped += 1; continue
         if nii_out.exists() and not args.overwrite:
+            print(f"  skip {fp.name} (draft exists)", flush=True)
             skipped += 1; continue
         try:
             if fp.suffix.lower() == ".dcm":
