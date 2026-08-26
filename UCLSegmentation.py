@@ -163,10 +163,17 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         # image picker
         self._img_combo = qt.QComboBox(); self._img_combo.setStyleSheet("padding:4px;")
         fl3.addRow("Image:", self._img_combo)
+        self._img_progress = qt.QLabel("—")
+        self._img_progress.setStyleSheet("color:#888;font-size:11px;padding:2px 4px;")
+        fl3.addRow("Progress:", self._img_progress)
         btnRefImg = btn("Refresh Images", "#444"); btnRefImg.clicked.connect(self._refresh_images); fl3.addRow(btnRefImg)
 
         btnLoad = btn("Load Image in Viewer", "#1A5276", "Loads DICOM/PNG into Slicer and opens Segment Editor")
         btnLoad.clicked.connect(self._on_load_for_labeling); fl3.addRow(btnLoad)
+
+        btnNext = btn("Load Next Unreviewed  →", "#B36B00",
+                      "Jumps to the next ~ image (model proposal awaiting correction) and loads it")
+        btnNext.clicked.connect(self._on_load_next_unreviewed); fl3.addRow(btnNext)
 
         btnSeg = btn("Open Segment Editor", "#2874A6", "Opens Slicer Segment Editor to draw humerus/ulna etc.")
         btnSeg.clicked.connect(self._on_open_seg_editor); fl3.addRow(btnSeg)
@@ -470,6 +477,16 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
             elif has_draft: label = f"~ {f.name}"   # model proposal, unreviewed
             else:           label = f.name
             self._img_combo.addItem(label, f.name)
+        n_final = sum(1 for i in range(self._img_combo.count)
+                      if self._img_combo.itemText(i).startswith("✓"))
+        n_draft = sum(1 for i in range(self._img_combo.count)
+                      if self._img_combo.itemText(i).startswith("~"))
+        n_none  = self._img_combo.count - n_final - n_draft
+        try:
+            self._img_progress.setText(
+                f"✓ {n_final} verified   ~ {n_draft} to review   {n_none} unlabeled")
+        except Exception:
+            pass
 
     def _refresh_labels(self):
         self._label_list.clear()
@@ -692,6 +709,21 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         self._seg_node.CreateDefaultDisplayNodes()
         self._seg_node.GetDisplayNode().SetVisibility(True)
 
+    def _on_load_next_unreviewed(self):
+        """Jump to the next ~ image (draft awaiting correction) and load it."""
+        count = self._img_combo.count
+        if count == 0:
+            self._set_status(self._label_st,"No images — select subject/session and Refresh","#A32D2D"); return
+        start = self._img_combo.currentIndex
+        for step in range(1, count + 1):
+            i = (start + step) % count
+            if self._img_combo.itemText(i).startswith("~"):
+                self._img_combo.setCurrentIndex(i)
+                self._on_load_for_labeling()
+                return
+        self._set_status(self._label_st,
+                         "✓ No unreviewed images left in this session — all done!","#0F6E56")
+
     def _on_open_seg_editor(self):
         """Switch to Segment Editor module."""
         if self._seg_node is None:
@@ -748,6 +780,14 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
 
             slicer.util.saveNode(lm_node, str(out_path))
             slicer.mrmlScene.RemoveNode(lm_node)
+
+            # retire the model draft — this image is now human-verified
+            draft_dir = self._current_draft_mask_dir()
+            if draft_dir:
+                dp = draft_dir / (self._current_img_stem + ".nii.gz")
+                if dp.exists():
+                    try: dp.unlink()
+                    except Exception: pass
 
             self._set_status(self._label_st,
                              f"✓ Saved labels → {out_path.name}", "#0F6E56")
@@ -950,9 +990,9 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
             backbone  = ck.get("backbone", "unet")
         except Exception: pass
 
-        # count labeled images
+        # count human-verified labels only — masks_draft/ proposals excluded
         try:
-            masks = list((PIPELINE/"subjects").rglob("*.nii.gz"))
+            masks = list((PIPELINE/"subjects").glob("*/sessions/*/masks/*.nii.gz"))
             num_labels = str(len(masks))
         except Exception: pass
 
@@ -1054,7 +1094,7 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
                 # auto-register version
                 import datetime
                 try:
-                    masks = list((PIPELINE/"subjects").rglob("*.nii.gz"))
+                    masks = list((PIPELINE/"subjects").glob("*/sessions/*/masks/*.nii.gz"))
                     num_labels = str(len(masks))
                 except Exception:
                     num_labels = "?"

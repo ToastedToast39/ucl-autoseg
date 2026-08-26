@@ -106,9 +106,11 @@ def save_nifti(labels: np.ndarray, out_path: Path):
         # fallback: save as PNG only
         print(f"  (nibabel not installed — saving PNG mask only, not NIfTI)")
         return False
-    # NIfTI expects (X,Y,Z) — for a 2D image we add a Z dimension of 1
-    data = labels.astype(np.int16)[..., np.newaxis]
-    img  = nib.Nifti1Image(data, affine=np.eye(4))
+    # Slicer convention: (X=cols, Y=rows, Z=1) with LPS-flip affine — matches
+    # what Segment Editor saves and what ucl/data.py load_mask() expects.
+    data   = labels.T.astype(np.int16)[..., np.newaxis]
+    affine = np.diag([-1.0, -1.0, 1.0, 1.0])
+    img  = nib.Nifti1Image(data, affine=affine)
     nib.save(img, str(out_path))
     return True
 

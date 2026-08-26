@@ -133,8 +133,12 @@ def save_nifti_mask(labels, out_path):
     if not _HAS_NIBABEL:
         print("  (nibabel not installed — skipping .nii.gz mask output)")
         return False
-    data = labels.astype(np.int16)[..., np.newaxis]
-    img  = nib.Nifti1Image(data, affine=np.eye(4))
+    # Slicer saves masks as (X=cols, Y=rows, Z) with an LPS-flip affine, and
+    # ucl/data.py load_mask() transposes on read to match. Write the same way
+    # so drafts overlay correctly in Slicer AND read back correctly in training.
+    data   = labels.T.astype(np.int16)[..., np.newaxis]
+    affine = np.diag([-1.0, -1.0, 1.0, 1.0])
+    img  = nib.Nifti1Image(data, affine=affine)
     nib.save(img, str(out_path))
     return True
 
