@@ -1009,13 +1009,20 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
             try:
                 active = json.loads((PIPELINE/"VERSIONS.json").read_text()).get("active", "")
             except Exception: pass
-            rec = {
-                "source": "corrected_prelabel" if was_draft else "manual",
-                "date":   datetime.date.today().isoformat(),
-                "model":  active if was_draft else "",
-            }
-            if draft_dice is not None:
-                rec["draft_dice"] = round(draft_dice, 4)
+            prev = data.get(key, {})
+            if not was_draft and prev.get("source") == "corrected_prelabel":
+                # re-save of an already-corrected image (draft long retired) —
+                # never downgrade: keep its model + draft_dice, refresh the date
+                rec = dict(prev)
+                rec["date"] = datetime.date.today().isoformat()
+            else:
+                rec = {
+                    "source": "corrected_prelabel" if was_draft else "manual",
+                    "date":   datetime.date.today().isoformat(),
+                    "model":  active if was_draft else "",
+                }
+                if draft_dice is not None:
+                    rec["draft_dice"] = round(draft_dice, 4)
             data[key] = rec
             pf.write_text(json.dumps(data, indent=2))
         except Exception as e:

@@ -98,5 +98,11 @@
     "source": "manual_baseline",
     "date": "2026-06-09",
     "model": ""
+  },
+  "Jacob_Villar/session_01/capture_10_2026-01-24T09-52-10": {
+    "source": "corrected_prelabel",
+    "date": "2026-08-26",
+    "model": "v7_20260610",
+    "draft_dice": 0.4762
   }
 }
