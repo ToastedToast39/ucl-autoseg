@@ -892,19 +892,26 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
 
             # retire the model draft — this image is now human-verified.
             # A draft existing at save time means this was a corrected pre-label,
-            # not a from-scratch manual label — record that provenance.
+            # not a from-scratch manual label — record that provenance. Before
+            # deleting the draft, score it against the corrected mask: on a
+            # never-trained subject this is an honest accuracy sample, unlike
+            # eval on training images.
             was_draft = False
+            draft_dice = None
             draft_dir = self._current_draft_mask_dir()
             if draft_dir:
                 dp = draft_dir / (self._current_img_stem + ".nii.gz")
                 if dp.exists():
                     was_draft = True
+                    draft_dice = self._dice_between(dp, out_path)
                     try: dp.unlink()
                     except Exception: pass
-            self._record_provenance(self._current_img_stem, was_draft)
+            self._record_provenance(self._current_img_stem, was_draft, draft_dice)
 
-            self._set_status(self._label_st,
-                             f"✓ Saved labels → {out_path.name}", "#0F6E56")
+            msg = f"✓ Saved labels → {out_path.name}"
+            if draft_dice is not None:
+                msg += f"   (model draft was {draft_dice:.2f} dice vs your correction)"
+            self._set_status(self._label_st, msg, "#0F6E56")
             # refresh image list to show ✓ tick
             self._refresh_images()
 
@@ -973,7 +980,24 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         if key in data:  # just excluded → keep the correction loop moving
             self._on_load_next_unreviewed(open_editor=True)
 
-    def _record_provenance(self, stem, was_draft):
+    def _dice_between(self, path_a, path_b):
+        """Mean foreground dice between two Slicer-convention NIfTI masks —
+        used to score a model draft against its human correction."""
+        try:
+            import nibabel as nib
+            a = np.asarray(nib.load(str(path_a)).dataobj).squeeze()
+            b = np.asarray(nib.load(str(path_b)).dataobj).squeeze()
+            if a.shape != b.shape: return None
+            scores = []
+            for c in (1, 2):
+                pa, pb = (a == c), (b == c)
+                denom = pa.sum() + pb.sum()
+                if denom: scores.append(2 * np.logical_and(pa, pb).sum() / denom)
+            return float(np.mean(scores)) if scores else None
+        except Exception:
+            return None
+
+    def _record_provenance(self, stem, was_draft, draft_dice=None):
         """Track how each verified mask was made: corrected pre-label vs manual.
         Keyed per image so re-saving updates instead of double-counting."""
         try:
@@ -985,11 +1009,14 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
             try:
                 active = json.loads((PIPELINE/"VERSIONS.json").read_text()).get("active", "")
             except Exception: pass
-            data[key] = {
+            rec = {
                 "source": "corrected_prelabel" if was_draft else "manual",
                 "date":   datetime.date.today().isoformat(),
                 "model":  active if was_draft else "",
             }
+            if draft_dice is not None:
+                rec["draft_dice"] = round(draft_dice, 4)
+            data[key] = rec
             pf.write_text(json.dumps(data, indent=2))
         except Exception as e:
             print(f"provenance record failed: {e}")
