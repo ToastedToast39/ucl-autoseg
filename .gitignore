@@ -10,6 +10,7 @@ subjects/*/sessions/*/overlays/
 
 _train_seg/
 _train_lm/
+eval_overlays/
 models/*.pt
 __pycache__/
 *.pyc

@@ -289,6 +289,15 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         fl5.addRow("Progress:", self._train_pb)
         self._train_st = sl(); fl5.addRow("Status:", self._train_st)
 
+        btnEval = btn("Evaluate Model vs Verified Labels", "#4A235A",
+                      "Scores the active model against every human-verified mask, logs "
+                      "per-subject dice to training_runs.xlsx (Eval History), and opens "
+                      "the side-by-side comparison images")
+        btnEval.clicked.connect(self._on_eval); fl5.addRow(btnEval)
+        self._eval_pb = pb()
+        fl5.addRow("Eval progress:", self._eval_pb)
+        self._eval_st = sl(); fl5.addRow("Eval status:", self._eval_st)
+
         # ⑧ MODEL VERSIONS
         cb_mv, fl_mv = section("⑨ Model Versions", "#1A5276", collapsed=True)
 
@@ -1293,6 +1302,40 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
              "--data",str(PIPELINE/"_train_seg"),"--epochs",str(epochs),
              "--resize","320","512","--out",out_path]
         self._set_status(self._train_st,"Training started…","#888"); self._run_bg(cmd,done,on_line)
+
+    def _on_eval(self):
+        """Score the active model against all verified masks; log + show overlays."""
+        sm = PIPELINE/"models"/"ucl_seg.pt"
+        if not sm.exists():
+            self._set_status(self._eval_st,"No model — train first","#A32D2D"); return
+        n_masks = len(list((PIPELINE/"subjects").glob("*/sessions/*/masks/*.nii.gz")))
+        if n_masks == 0:
+            self._set_status(self._eval_st,"No verified masks to evaluate against","#A32D2D"); return
+        out_dir = PIPELINE/"eval_overlays"
+        total = n_masks + 10   # summary lines
+        dc=[0]
+        self._set_pb(self._eval_pb,3); self._set_status(self._eval_st,"Evaluating…","#888")
+        def on_line(line):
+            dc[0]+=1; self._set_pb(self._eval_pb,min(95,3+int(dc[0]/total*92)))
+        def done(rc,out):
+            if rc==0:
+                self._set_pb(self._eval_pb,100)
+                m = re.search(r'OVERALL \((\d+) images\)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)', out)
+                if m:
+                    self._set_status(self._eval_st,
+                        f"✓ {m.group(1)} images — humerus {m.group(2)}  ulna {m.group(3)}  "
+                        f"mean {m.group(4)} — logged to spreadsheet","#0F6E56")
+                else:
+                    self._set_status(self._eval_st,"✓ Done — see console for table","#0F6E56")
+                print(out)
+                try:
+                    qt.QDesktopServices.openUrl(qt.QUrl.fromLocalFile(str(out_dir)))
+                except Exception: pass
+            else:
+                self._set_pb(self._eval_pb,0,False)
+                self._set_status(self._eval_st,"✗ Eval failed — see console","#A32D2D"); print(out)
+        self._run_bg([self._py(),str(PIPELINE/"scripts"/"eval_verified.py"),
+                      "--log","--overlays",str(out_dir)],done,on_line)
 
     def _on_prelabel(self):
         if not self._current_subject or self._current_subject.startswith("("):
