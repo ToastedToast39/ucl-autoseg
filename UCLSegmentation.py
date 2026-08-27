@@ -1460,8 +1460,10 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
     # ---- QC METHODS ----
 
     def _collect_labeled_images(self):
-        """Collect all (img_path, mask_path) pairs across all subjects/sessions."""
+        """Collect all (img_path, mask_path) pairs across all subjects/sessions.
+        Skips excluded (wrong-anatomy) images so QC reviews exactly what trains."""
         pairs = []
+        excluded = self._load_exclusions()
         subjects_dir = PIPELINE / "subjects"
         if not subjects_dir.exists(): return pairs
         for subj in sorted(subjects_dir.iterdir()):
@@ -1479,6 +1481,8 @@ print(f"Done. {copied} DICOMs copied, {skipped} already existed.")
                 for img in sorted(list(img_dir.glob("*.dcm")) +
                                   list(img_dir.glob("*.png")) +
                                   list(img_dir.glob("*.jpg"))):
+                    if f"{subj.name}/{sess.name}/{img.stem}" in excluded:
+                        continue
                     nii = mask_dir / (img.stem + ".nii.gz")
                     png = mask_dir / (img.stem + ".png")
                     if nii.exists():
