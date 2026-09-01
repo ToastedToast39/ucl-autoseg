@@ -977,8 +977,9 @@ class UCLSegmentationWidget(ScriptedLoadableModuleWidget):
         pf.write_text(json.dumps(data, indent=2))
         self._set_status(self._label_st, msg, col)
         self._refresh_images()
-        if key in data:  # just excluded → keep the correction loop moving
-            self._on_load_next_unreviewed(open_editor=True)
+        if key in data:  # just excluded → advance to the next draft, but stay
+            # on the module panel — jumping to Segment Editor mid-triage is jarring
+            self._on_load_next_unreviewed(open_editor=False)
 
     def _dice_between(self, path_a, path_b):
         """Mean foreground dice between two Slicer-convention NIfTI masks —
