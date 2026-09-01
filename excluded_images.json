@@ -1,1 +1,50 @@
-{}
+{
+  "PLUCSD002/session_01/P9OC0JSI": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-08-26"
+  },
+  "Jake_villar/session_01/capture_12_2025-12-09T14-59-41": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-09-01"
+  },
+  "Jake_villar/session_01/capture_12_2025-12-09T17-06-54": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-09-01"
+  },
+  "Jake_villar/session_01/capture_13_2025-12-09T15-00-00": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-09-01"
+  },
+  "Jake_villar/session_01/capture_14_2025-12-09T15-00-03": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-09-01"
+  },
+  "Jake_villar/session_01/capture_13_2025-12-09T17-07-00": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-09-01"
+  },
+  "Jake_villar/session_01/capture_14_2025-12-09T17-07-07": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-09-01"
+  },
+  "Jake_villar/session_01/capture_15_2025-12-09T15-00-06": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-09-01"
+  },
+  "Jake_villar/session_01/capture_15_2025-12-09T17-07-51": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-09-01"
+  },
+  "Jake_villar/session_01/capture_16_2025-12-09T15-00-30": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-09-01"
+  },
+  "Jake_villar/session_01/capture_16_2025-12-09T17-07-52": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-09-01"
+  },
+  "Jake_villar/session_01/capture_17_2025-12-09T15-00-32": {
+    "reason": "non_ucl_anatomy",
+    "date": "2026-09-01"
+  }
+}
